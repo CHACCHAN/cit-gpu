@@ -2,8 +2,8 @@
 #SBATCH --partition=research
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --gpus-per-task=2
+#SBATCH --cpus-per-task=32
+#SBATCH --gpus-per-task=8
 #SBATCH --mem=256G
 #SBATCH --container=pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 #SBATCH --output=logs/ollama-%j.log
@@ -46,5 +46,15 @@ export OLLAMA_BASE_URL="http://127.0.0.1:11434"
 open-webui serve --port 8080 > logs/webui.log 2>&1 &
 sleep 5
 
-echo "--- Generating Secure Public URL ---"
-./cloudflared tunnel --url http://127.0.0.1:8080
+echo "--- Setting up ngrok Permanent URL ---"
+if [ ! -f "./ngrok" ]; then
+    echo "Downloading ngrok binary..."
+    wget -q https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
+    tar -xzf ngrok-v3-stable-linux-amd64.tgz
+    rm ngrok-v3-stable-linux-amd64.tgz
+fi
+
+./ngrok config add-authtoken 3EzBcQykAjatrx3fz54yZWZJkh4_29WnQF6U7t6CnNTXQoxHE
+
+echo "Starting ngrok tunnel..."
+./ngrok http 8080 --domain=scoff-supreme-nearby.ngrok-free.dev
