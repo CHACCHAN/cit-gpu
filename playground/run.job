@@ -1,0 +1,21 @@
+#!/bin/bash
+#SBATCH --partition=research
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --gpus-per-task=1
+#SBATCH --mem=128G
+#SBATCH --container=pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+#SBATCH --output=logs/%j.log
+
+mkdir -p images
+mkdir -p logs
+
+pip install --no-cache-dir \
+    diffusers==0.31.0 \
+    transformers==4.43.3 \
+    accelerate==0.34.0 \
+    protobuf \
+    sentencepiece
+
+python3 run.py

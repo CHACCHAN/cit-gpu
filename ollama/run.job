@@ -1,0 +1,50 @@
+#!/bin/bash
+#SBATCH --partition=research
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --gpus-per-task=2
+#SBATCH --mem=256G
+#SBATCH --container=pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+#SBATCH --output=logs/ollama-%j.log
+#SBATCH --error=logs/ollama-%j.err
+
+mkdir -p logs
+mkdir -p .data/ollama
+mkdir -p .data/open-webui
+
+export OLLAMA_MODELS="$PWD/.data/ollama"
+export DATA_DIR="$PWD/.data/open-webui"
+
+echo "--- Installing curl into container ---"
+apt-get update && apt-get install -y curl
+
+echo "--- Running Official Ollama Installer ---"
+curl -fsSL https://ollama.com/install.sh | sh
+
+if [ ! -f "./cloudflared" ]; then
+    echo "--- Downloading Cloudflared Binary ---"
+    python3 download_cloudflare.py
+fi
+
+echo "--- Ensuring Open WebUI is installed ---"
+pip install --no-cache-dir open-webui
+
+echo "--- Checking Ollama Server Status ---"
+export OLLAMA_HOST="127.0.0.1:11434"
+
+if ollama list > /dev/null 2>&1; then
+    echo "Ollama Server is already running perfectly!"
+else
+    echo "Ollama Server is not running. Starting it now..."
+    ollama serve > logs/ollama_daemon.log 2>&1 &
+    sleep 10
+fi
+
+export WEBUI_AUTH="False"
+export OLLAMA_BASE_URL="http://127.0.0.1:11434"
+open-webui serve --port 8080 > logs/webui.log 2>&1 &
+sleep 5
+
+echo "--- Generating Secure Public URL ---"
+./cloudflared tunnel --url http://127.0.0.1:8080
