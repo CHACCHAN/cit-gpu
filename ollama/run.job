@@ -9,6 +9,15 @@
 #SBATCH --output=logs/ollama-%j.log
 #SBATCH --error=logs/ollama-%j.err
 
+if [ -f .env ]; then
+    source .env
+fi
+
+if [ -z "$NGROK_AUTHTOKEN" ]; then
+    echo "ERROR: NGROK_AUTHTOKEN is not set. Please check your .env file."
+    exit 1
+fi
+
 mkdir -p logs
 mkdir -p .data/ollama
 mkdir -p .data/open-webui
@@ -54,7 +63,7 @@ if [ ! -f "./ngrok" ]; then
     rm ngrok-v3-stable-linux-amd64.tgz
 fi
 
-./ngrok config add-authtoken 3EzBcQykAjatrx3fz54yZWZJkh4_29WnQF6U7t6CnNTXQoxHE
+./ngrok config add-authtoken "$NGROK_AUTHTOKEN"
 
 echo "Starting ngrok tunnel..."
 ./ngrok http 8080 --domain=scoff-supreme-nearby.ngrok-free.dev

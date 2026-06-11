@@ -2,4 +2,5 @@ logs
 .data
 .run*
 .webui*
+.env
 cloudflared
