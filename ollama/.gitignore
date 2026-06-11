@@ -1,6 +1,6 @@
 logs
 .data
-.run*
+.ollama*
 .webui*
 .env
-cloudflared
+ngrok

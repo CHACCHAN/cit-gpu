@@ -16,8 +16,8 @@ mkdir -p .data/open-webui
 export OLLAMA_MODELS="$PWD/.data/ollama"
 export DATA_DIR="$PWD/.data/open-webui"
 
-echo "--- Installing curl into container ---"
-apt-get update && apt-get install -y curl
+echo "--- Installing curl and wget into container ---"
+apt-get update && apt-get install -y curl wget
 
 echo "--- Running Official Ollama Installer ---"
 curl -fsSL https://ollama.com/install.sh | sh
