@@ -1,21 +1,12 @@
 #!/bin/bash
-#SBATCH --partition=research
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
-#SBATCH --gpus-per-task=8
-#SBATCH --mem=256G
 #SBATCH --container=pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 #SBATCH --output=logs/ollama-%j.log
 #SBATCH --error=logs/ollama-%j.err
 
 if [ -f .env ]; then
     source .env
-fi
-
-if [ -z "$NGROK_AUTHTOKEN" ]; then
-    echo "ERROR: NGROK_AUTHTOKEN is not set. Please check your .env file."
-    exit 1
 fi
 
 mkdir -p logs
@@ -30,11 +21,6 @@ apt-get update && apt-get install -y curl
 
 echo "--- Running Official Ollama Installer ---"
 curl -fsSL https://ollama.com/install.sh | sh
-
-if [ ! -f "./cloudflared" ]; then
-    echo "--- Downloading Cloudflared Binary ---"
-    python3 download_cloudflare.py
-fi
 
 echo "--- Ensuring Open WebUI is installed ---"
 pip install --no-cache-dir open-webui
