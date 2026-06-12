@@ -89,5 +89,10 @@ fi
 
 ngrok config add-authtoken "$NGROK_AUTHTOKEN"
 
-ngrok http 11434 --domain=api.scoff-supreme-nearby.ngrok-free.dev > logs/ngrok_api.log 2>&1 &
-ngrok http 8080 --domain=web.scoff-supreme-nearby.ngrok-free.dev > logs/ngrok_web.log 2>&1 &
+# 自己修復
+if [ -n "$SLURM_JOB_ID" ]; then
+    sbatch --dependency=afterany:$SLURM_JOB_ID sglang.job
+    echo "Auto-restart scheduled. Next job will start when this one dies."
+fi
+
+ngrok http --url=https://scoff-supreme-nearby.ngrok-free.dev 8080
