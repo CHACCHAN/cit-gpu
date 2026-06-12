@@ -1,6 +1,6 @@
 logs
 .data
-.ollama*
+.vllm*
 .webui_secret_key
 .env
 ngrok
