@@ -12,11 +12,13 @@ if [ -z "$NGROK_AUTHTOKEN" ]; then
     exit 1
 fi
 
-echo "Deploying Ollama on Partition: ${SLURM_PARTITION} with Max Performance..."
+rm -rf logs
+
+echo "Deploying vLLM on Partition: ${SLURM_PARTITION} with Max Performance..."
 
 sbatch \
   --partition="${SLURM_PARTITION}" \
   --cpus-per-task="${SLURM_CPUS}" \
   --gpus-per-task="${SLURM_GPUS}" \
   --mem="${SLURM_MEM}" \
-  ollama.job
+  vllm.job

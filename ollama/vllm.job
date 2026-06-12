@@ -1,0 +1,83 @@
+#!/bin/bash
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --container=pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
+#SBATCH --output=logs/vllm-%j.log
+#SBATCH --error=logs/vllm-%j.err
+
+if [ -f .env ]; then
+    source .env
+fi
+
+mkdir -p logs
+mkdir -p .data/vllm
+mkdir -p .data/open-webui
+mkdir -p .data/bin
+mkdir -p .data/python
+
+export LC_ALL=C
+export DEBIAN_FRONTEND=noninteractive
+export DATA_DIR="$PWD/.data/open-webui"
+export HF_HOME="$PWD/.data/vllm" # モデルの保存先
+export PATH="$PWD/.data/python/bin:$PWD/.data/bin:$PATH"
+
+# 前提ツール
+if [ ! -f "/usr/bin/wget" ]; then
+    apt-get update && apt-get install -y curl wget ffmpeg
+fi
+
+# Portable Python3
+if [ ! -f ".data/python/bin/python3" ]; then
+    echo "Installing standalone portable Python 3.11..."
+    wget -q https://github.com/indygreg/python-build-standalone/releases/download/20240107/cpython-3.11.7+20240107-x86_64-unknown-linux-gnu-install_only.tar.gz
+    tar -xzf cpython-3.11.7+20240107-x86_64-unknown-linux-gnu-install_only.tar.gz -C .data/
+    rm cpython-3.11.7+20240107-x86_64-unknown-linux-gnu-install_only.tar.gz
+fi
+
+# vLLM Open WebUI
+if [ ! -f ".data/python/bin/vllm" ]; then
+    echo "Installing vLLM (CUDA 11.8 compatible) and Open WebUI..."
+    .data/python/bin/pip3 install --upgrade pip --root-user-action=ignore
+    .data/python/bin/pip3 install vllm open-webui --root-user-action=ignore
+fi
+
+# Run vLLM
+GPU_COUNT=${SLURM_GPUS:-4}
+echo "Using Model: ${VLLM_MODEL}"
+echo "Running on ${GPU_COUNT} GPUs (Tensor Parallel)"
+
+if ! pgrep -f "vllm.entrypoints.openai.api_server" > /dev/null; then
+    .data/python/bin/python3 -m vllm.entrypoints.openai.api_server \
+        --model "${VLLM_MODEL}" \
+        --port 11434 \
+        --tensor-parallel-size "${GPU_COUNT}" \
+        --trust-remote-code > logs/vllm_daemon.log 2>&1 &
+fi
+
+echo "Waiting for vLLM server to heat up and load model..."
+for i in {1..120}; do
+    if (echo > /dev/tcp/127.0.0.1/11434) >/dev/null 2>&1; then
+        echo "vLLM engine is up and running!"
+        break
+    fi
+    echo "Still waiting for engine... (${i}/120)"
+    sleep 5
+done
+
+# Run Open WebUI
+export WEBUI_AUTH="True"
+export OPENAI_API_BASE_URL="http://127.0.0.1:11434/v1"
+export OPENAI_API_KEY="none"
+.data/python/bin/open-webui serve --port 8080 > logs/webui.log 2>&1 &
+sleep 5
+
+# ngrok
+if [ ! -f ".data/bin/ngrok" ]; then
+    wget -q https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
+    tar -xzf ngrok-v3-stable-linux-amd64.tgz
+    mv ngrok .data/bin/ngrok
+    rm ngrok-v3-stable-linux-amd64.tgz
+fi
+
+ngrok config add-authtoken "$NGROK_AUTHTOKEN"
+ngrok http 8080 --domain=scoff-supreme-nearby.ngrok-free.dev
