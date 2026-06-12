@@ -14,6 +14,8 @@ mkdir -p .data/sglang
 mkdir -p .data/open-webui
 mkdir -p .data/bin
 mkdir -p .data/python
+mkdir -p .data/cache/triton
+mkdir -p .data/cache/nv
 
 export LC_ALL=C
 export DEBIAN_FRONTEND=noninteractive
@@ -23,6 +25,8 @@ export PATH="$PWD/.data/python/bin:$PWD/.data/bin:$PATH"
 export CUDA_HOME="/usr/local/cuda-12.1"
 export NVCC_PREPEND_FLAGS="--allow-unsupported-compiler"
 export SGLANG_CUDA_GRAPH_MAX_BATCH_SIZE=16
+export TRITON_CACHE_DIR="$PWD/.data/cache/triton"
+export CUDA_CACHE_PATH="$PWD/.data/cache/nv"
 
 # 前提ツール
 if [ ! -f "/usr/bin/wget" ]; then
@@ -38,10 +42,11 @@ if [ ! -f ".data/python/bin/python3" ]; then
 fi
 
 # SGLang Open WebUI
-if [ ! -f ".data/python/bin/sgl_pytorch_server" ] && [ ! -f ".data/python/bin/sglang" ]; then
+if [ ! -f ".data/python/.install_done" ]; then
     echo "Installing SGLang (Universal Engine) and Open WebUI..."
     .data/python/bin/pip3 install --upgrade pip --root-user-action=ignore
     .data/python/bin/pip3 install "sglang[all]" open-webui --root-user-action=ignore
+    touch .data/python/.install_done
 fi
 
 GPU_COUNT=${SLURM_GPUS:-1}
@@ -83,4 +88,6 @@ if [ ! -f ".data/bin/ngrok" ]; then
 fi
 
 ngrok config add-authtoken "$NGROK_AUTHTOKEN"
-ngrok http 8080 --domain=scoff-supreme-nearby.ngrok-free.dev
+
+ngrok http 11434 --domain=api.scoff-supreme-nearby.ngrok-free.dev > logs/ngrok_api.log 2>&1 &
+ngrok http 8080 --domain=web.scoff-supreme-nearby.ngrok-free.dev > logs/ngrok_web.log 2>&1 &
