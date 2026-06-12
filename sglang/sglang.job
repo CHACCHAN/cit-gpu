@@ -1,16 +1,16 @@
 #!/bin/bash
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --container=pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
-#SBATCH --output=logs/vllm-%j.log
-#SBATCH --error=logs/vllm-%j.err
+#SBATCH --container=pytorch/pytorch:2.4.1-cuda12.1-cudnn9-devel
+#SBATCH --output=logs/%j.log
+#SBATCH --error=logs/%j.err
 
 if [ -f .env ]; then
     source .env
 fi
 
 mkdir -p logs
-mkdir -p .data/vllm
+mkdir -p .data/sglang
 mkdir -p .data/open-webui
 mkdir -p .data/bin
 mkdir -p .data/python
@@ -18,8 +18,11 @@ mkdir -p .data/python
 export LC_ALL=C
 export DEBIAN_FRONTEND=noninteractive
 export DATA_DIR="$PWD/.data/open-webui"
-export HF_HOME="$PWD/.data/vllm" # モデルの保存先
+export HF_HOME="$PWD/.data/sglang"
 export PATH="$PWD/.data/python/bin:$PWD/.data/bin:$PATH"
+export CUDA_HOME="/usr/local/cuda-12.1"
+export NVCC_PREPEND_FLAGS="--allow-unsupported-compiler"
+export SGLANG_CUDA_GRAPH_MAX_BATCH_SIZE=16
 
 # 前提ツール
 if [ ! -f "/usr/bin/wget" ]; then
@@ -34,30 +37,30 @@ if [ ! -f ".data/python/bin/python3" ]; then
     rm cpython-3.11.7+20240107-x86_64-unknown-linux-gnu-install_only.tar.gz
 fi
 
-# vLLM Open WebUI
-if [ ! -f ".data/python/bin/vllm" ]; then
-    echo "Installing vLLM (CUDA 11.8 compatible) and Open WebUI..."
+# SGLang Open WebUI
+if [ ! -f ".data/python/bin/sgl_pytorch_server" ] && [ ! -f ".data/python/bin/sglang" ]; then
+    echo "Installing SGLang (Universal Engine) and Open WebUI..."
     .data/python/bin/pip3 install --upgrade pip --root-user-action=ignore
-    .data/python/bin/pip3 install vllm open-webui --root-user-action=ignore
+    .data/python/bin/pip3 install "sglang[all]" open-webui --root-user-action=ignore
 fi
 
-# Run vLLM
-GPU_COUNT=${SLURM_GPUS:-4}
-echo "Using Model: ${VLLM_MODEL}"
-echo "Running on ${GPU_COUNT} GPUs (Tensor Parallel)"
+GPU_COUNT=${SLURM_GPUS:-1}
+echo "Using Model: ${MODEL}"
+echo "Running on ${GPU_COUNT} GPUs (Tensor Parallel via SGLang)"
 
-if ! pgrep -f "vllm.entrypoints.openai.api_server" > /dev/null; then
-    .data/python/bin/python3 -m vllm.entrypoints.openai.api_server \
-        --model "${VLLM_MODEL}" \
+# Run SGLang Engine
+if ! pgrep -f "sglang.launch_server" > /dev/null; then
+    .data/python/bin/python3 -m sglang.launch_server \
+        --model-path "${MODEL}" \
         --port 11434 \
-        --tensor-parallel-size "${GPU_COUNT}" \
-        --trust-remote-code > logs/vllm_daemon.log 2>&1 &
+        --tp "${GPU_COUNT}" \
+        --trust-remote-code > logs/sglang_daemon.log 2>&1 &
 fi
 
-echo "Waiting for vLLM server to heat up and load model..."
+echo "Waiting for SGLang server to heat up and load model..."
 for i in {1..120}; do
     if (echo > /dev/tcp/127.0.0.1/11434) >/dev/null 2>&1; then
-        echo "vLLM engine is up and running!"
+        echo "SGLang engine is up and running perfectly!"
         break
     fi
     echo "Still waiting for engine... (${i}/120)"
