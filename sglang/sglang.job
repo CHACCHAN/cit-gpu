@@ -1,5 +1,4 @@
 #!/bin/bash
-#SBATCH --partition=research
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --container=pytorch/pytorch:2.4.1-cuda12.1-cudnn9-devel
@@ -28,6 +27,9 @@ export NVCC_PREPEND_FLAGS="--allow-unsupported-compiler"
 export SGLANG_CUDA_GRAPH_MAX_BATCH_SIZE=16
 export TRITON_CACHE_DIR="$PWD/.data/cache/triton"
 export CUDA_CACHE_PATH="$PWD/.data/cache/nv"
+export WEBUI_AUTH="True"
+export OPENAI_API_BASE_URL="http://127.0.0.1:11434/v1"
+export OPENAI_API_KEY="none"
 
 # 前提ツール
 if [ ! -f "/usr/bin/wget" ]; then
@@ -56,11 +58,20 @@ echo "Running on ${GPU_COUNT} GPUs (Tensor Parallel via SGLang)"
 
 # Run SGLang Engine
 if ! pgrep -f "sglang.launch_server" > /dev/null; then
+    SGLANG_ARGS=(
+        --model-path "${MODEL}"
+        --port 11434
+        --tp "${GPU_COUNT}"
+        --trust-remote-code
+    )
+
+    # 量子化オプション（未設定の場合はオプションなし）
+    if [ -n "${QUANTIZATION:-}" ]; then
+        SGLANG_ARGS+=(--quantization "${QUANTIZATION}")
+    fi
+
     .data/python/bin/python3 -m sglang.launch_server \
-        --model-path "${MODEL}" \
-        --port 11434 \
-        --tp "${GPU_COUNT}" \
-        --trust-remote-code > logs/sglang_daemon.log 2>&1 &
+        "${SGLANG_ARGS[@]}" > logs/sglang_daemon.log 2>&1 &
 fi
 
 echo "Waiting for SGLang server to heat up and load model..."
@@ -89,11 +100,4 @@ if [ ! -f ".data/bin/ngrok" ]; then
 fi
 
 ngrok config add-authtoken "$NGROK_AUTHTOKEN"
-
-# 自己修復
-if [ -n "$SLURM_JOB_ID" ]; then
-    sbatch --dependency=afterany:$SLURM_JOB_ID sglang.job
-    echo "Auto-restart scheduled. Next job will start when this one dies."
-fi
-
 ngrok http --url=https://scoff-supreme-nearby.ngrok-free.dev 8080

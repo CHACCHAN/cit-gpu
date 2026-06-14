@@ -7,6 +7,8 @@ else
     exit 1
 fi
 
+export DOCKER_HOST="unix:////run/user/$(id -u)/docker.sock"
+
 rm -rf logs
 
 sbatch \
