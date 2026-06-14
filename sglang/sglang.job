@@ -25,11 +25,14 @@ export PATH="$PWD/.data/python/bin:$PWD/.data/bin:$PATH"
 export CUDA_HOME="/usr/local/cuda-12.1"
 export NVCC_PREPEND_FLAGS="--allow-unsupported-compiler"
 export SGLANG_CUDA_GRAPH_MAX_BATCH_SIZE=16
+export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 export TRITON_CACHE_DIR="$PWD/.data/cache/triton"
 export CUDA_CACHE_PATH="$PWD/.data/cache/nv"
 export WEBUI_AUTH="True"
 export OPENAI_API_BASE_URL="http://127.0.0.1:11434/v1"
 export OPENAI_API_KEY="none"
+export HF_TOKEN="${HF_TOKEN:-}"
+export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
 
 # 前提ツール
 if [ ! -f "/usr/bin/wget" ]; then
@@ -65,9 +68,14 @@ if ! pgrep -f "sglang.launch_server" > /dev/null; then
         --trust-remote-code
     )
 
-    # 量子化オプション（未設定の場合はオプションなし）
+    # 量子
     if [ -n "${QUANTIZATION:-}" ]; then
         SGLANG_ARGS+=(--quantization "${QUANTIZATION}")
+    fi
+
+    # コンテキスト長（未設定の場合はモデルデフォルト）
+    if [ -n "${CONTEXT_LENGTH:-}" ]; then
+        SGLANG_ARGS+=(--context-length "${CONTEXT_LENGTH}")
     fi
 
     .data/python/bin/python3 -m sglang.launch_server \
@@ -75,19 +83,28 @@ if ! pgrep -f "sglang.launch_server" > /dev/null; then
 fi
 
 echo "Waiting for SGLang server to heat up and load model..."
-for i in {1..120}; do
+STARTED=false
+for i in {1..480}; do
     if (echo > /dev/tcp/127.0.0.1/11434) >/dev/null 2>&1; then
         echo "SGLang engine is up and running perfectly!"
+        STARTED=true
         break
     fi
-    echo "Still waiting for engine... (${i}/120)"
+    echo "Still waiting for engine... (${i}/480)"
     sleep 5
 done
+
+if [ "$STARTED" = false ]; then
+    echo "ERROR: SGLang failed to start within timeout. Check logs/sglang_daemon.log"
+    exit 1
+fi
 
 # Run Open WebUI
 export WEBUI_AUTH="True"
 export OPENAI_API_BASE_URL="http://127.0.0.1:11434/v1"
 export OPENAI_API_KEY="none"
+export ENABLE_OLLAMA_API="false"
+export OLLAMA_BASE_URL=""
 .data/python/bin/open-webui serve --port 8080 > logs/webui.log 2>&1 &
 sleep 5
 
