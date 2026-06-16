@@ -1,0 +1,15 @@
+#!/bin/bash
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --output=logs/%j.log
+#SBATCH --error=logs/%j.err
+
+#container=pytorch/pytorch:2.4.1-cuda12.1-cudnn9-devel
+export XDG_RUNTIME_DIR="/tmp/${SLURM_JOB_UID}"
+
+sleep 5
+create_container -d sJIOXFZR5KjRM7CqgyRy -j ${SLURM_JOBID}
+echo $SLURM_SUBMIT_DIR > /tmp/sJIOXFZR5KjRM7CqgyRy/currentdir
+current=`echo $SLURM_SUBMIT_DIR | sed -e "s|$HOME|/root|g"`
+sleep 2
+srun --container=/tmp/sJIOXFZR5KjRM7CqgyRy /opt/nvidia/nvidia_entrypoint.sh  ${current}/.flux.job.run.sJIOXFZR5KjRM7CqgyRy

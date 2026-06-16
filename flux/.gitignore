@@ -1,0 +1,6 @@
+logs
+.data
+.env
+ngrok
+__pycache__
+*.pyc

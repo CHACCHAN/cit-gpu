@@ -1,0 +1,109 @@
+#!/bin/bash
+
+ulimit -s unlimited
+ulimit -Sn 65536
+
+if [ -f .env ]; then
+    source .env
+fi
+
+mkdir -p logs
+mkdir -p .data/hf
+mkdir -p .data/bin
+mkdir -p .data/python
+mkdir -p .data/cache/triton
+mkdir -p .data/cache/nv
+
+export LC_ALL=C
+export DEBIAN_FRONTEND=noninteractive
+# HFキャッシュは .data/hf に集約（永続化）
+export HF_HOME="$PWD/.data/hf"
+export PATH="$PWD/.data/python/bin:$PWD/.data/bin:$PATH"
+export CUDA_HOME="/usr/local/cuda-12.1"
+export NVCC_PREPEND_FLAGS="--allow-unsupported-compiler"
+export TRITON_CACHE_DIR="$PWD/.data/cache/triton"
+export CUDA_CACHE_PATH="$PWD/.data/cache/nv"
+export HF_TOKEN="${HF_TOKEN:-}"
+export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
+
+# APIサーバへ渡す生成設定
+export MODEL="${MODEL:-black-forest-labs/FLUX.1-dev}"
+export QUANTIZATION="${QUANTIZATION:-none}"
+export STEPS="${STEPS:-50}"
+export GUIDANCE="${GUIDANCE:-3.5}"
+export FLUX_API_PORT="${FLUX_API_PORT:-9090}"
+
+# 前提ツール
+if [ ! -f "/usr/bin/wget" ]; then
+    apt-get update && apt-get install -y curl wget
+fi
+
+# Portable Python 3.11
+if [ ! -f ".data/python/bin/python3" ]; then
+    echo "Installing standalone portable Python 3.11..."
+    wget -q https://github.com/indygreg/python-build-standalone/releases/download/20240107/cpython-3.11.7+20240107-x86_64-unknown-linux-gnu-install_only.tar.gz
+    tar -xzf cpython-3.11.7+20240107-x86_64-unknown-linux-gnu-install_only.tar.gz -C .data/
+    rm cpython-3.11.7+20240107-x86_64-unknown-linux-gnu-install_only.tar.gz
+fi
+
+# 依存パッケージ（FLUX + FastAPI）
+if [ ! -f ".data/python/.install_done" ]; then
+    echo "Installing FLUX dependencies..."
+    .data/python/bin/pip3 install --upgrade pip --root-user-action=ignore
+    .data/python/bin/pip3 install --root-user-action=ignore \
+        "torch==2.4.1" \
+        "diffusers==0.31.0" \
+        "transformers==4.46.3" \
+        "tokenizers==0.20.3" \
+        "accelerate==1.1.1" \
+        "huggingface-hub==0.26.5" \
+        "safetensors==0.4.5" \
+        "sentencepiece==0.2.0" \
+        "protobuf==5.28.3" \
+        "numpy<2" \
+        pillow \
+        fastapi \
+        "uvicorn[standard]" \
+        optimum-quanto
+    touch .data/python/.install_done
+fi
+
+GPU_COUNT=${SLURM_GPUS:-1}
+echo "Using Model: ${MODEL}"
+echo "Quantization: ${QUANTIZATION}"
+echo "Running FLUX API on ${GPU_COUNT} GPU(s)"
+
+# FLUX APIサーバ起動
+if ! pgrep -f "server.py" > /dev/null; then
+    .data/python/bin/python3 server.py > logs/flux_api.log 2>&1 &
+fi
+
+echo "Waiting for FLUX API to load model..."
+STARTED=false
+for i in {1..480}; do
+    if (echo > /dev/tcp/127.0.0.1/${FLUX_API_PORT}) >/dev/null 2>&1; then
+        echo "FLUX API is up and running!"
+        STARTED=true
+        break
+    fi
+    echo "Still loading model... (${i}/480)"
+    sleep 5
+done
+
+if [ "$STARTED" = false ]; then
+    echo "ERROR: FLUX API failed to start. Check logs/flux_api.log"
+    exit 1
+fi
+
+# ngrok
+if [ ! -f ".data/bin/ngrok" ]; then
+    wget -q https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
+    tar -xzf ngrok-v3-stable-linux-amd64.tgz
+    mv ngrok .data/bin/ngrok
+    rm ngrok-v3-stable-linux-amd64.tgz
+fi
+
+ngrok config add-authtoken "$NGROK_AUTHTOKEN"
+# 固定URLでAPIポートを公開（Open WebUIからこのURLを指定）
+ngrok http --url=${NGROK_URL} ${FLUX_API_PORT}
+
