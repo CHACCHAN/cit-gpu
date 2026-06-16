@@ -1,91 +1,139 @@
 """
-FLUX.1-dev OpenAI Images API 互換サーバ
-Open WebUI の Image Generation (OpenAI engine) から呼び出される。
+FLUX.1-dev OpenAI Images API 互換サーバ（2並列版）
+フルbf16を2GPUに分散させたパイプラインを2本立て、
+最大2リクエストを同時処理する。
 
-対応エンドポイント:
-  POST /v1/images/generations
-    body: { "prompt": str, "n": int, "size": "WxH", "response_format": "b64_json"|"url" }
-  GET  /health
+A4500 20GB x5 の現実的な最大構成:
+  - パイプライン1: GPU0 + GPU1 (各~17GB使用)
+  - パイプライン2: GPU2 + GPU3 (各~17GB使用)
+  - GPU4: 予備（推論バッファ・VAE用）
 """
 import os
 import io
 import base64
 import time
 import threading
-
-import torch
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+import secrets
+import unicodedata
+import queue
 from typing import Optional
 
+import torch
+from fastapi import FastAPI, HTTPException, Security
+from fastapi.security import APIKeyHeader
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
 # ---- 環境変数から設定 ----
-MODEL_ID      = os.environ.get("MODEL", "black-forest-labs/FLUX.1-dev")
-QUANTIZATION  = os.environ.get("QUANTIZATION", "none").lower()
-DEFAULT_STEPS = int(os.environ.get("STEPS", "50"))
+MODEL_ID      = os.environ.get("MODEL",          "black-forest-labs/FLUX.1-dev")
+DEFAULT_STEPS = int(os.environ.get("STEPS",      "50"))
 DEFAULT_GUID  = float(os.environ.get("GUIDANCE", "3.5"))
 API_PORT      = int(os.environ.get("FLUX_API_PORT", "9090"))
+_API_KEY      = os.environ.get("FLUX_API_KEY",   "").strip()
 
-# 生成は1枚ずつ逐次実行（VRAM保護のためロック）
-_gen_lock = threading.Lock()
-_pipe = None
+# 並列数: GPU数÷2（2GPUで1パイプライン）
+# GPU5枚 → 2パイプライン（GPU0+1, GPU2+3）、GPU4はバッファ
+NUM_GPUS_PER_PIPE = 2
+
+if not _API_KEY:
+    print("[flux-api] WARNING: FLUX_API_KEY is not set.", flush=True)
+else:
+    print("[flux-api] API key authentication enabled.", flush=True)
+
+# ---- APIキー認証 ----
+_api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
+
+def verify_api_key(authorization: str = Security(_api_key_header)):
+    if not _API_KEY:
+        return
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header required")
+    token = authorization.removeprefix("Bearer ").strip()
+    if not secrets.compare_digest(token, _API_KEY):
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
+# ---- 日本語翻訳 ----
+def _is_japanese(text: str) -> bool:
+    for ch in text:
+        name = unicodedata.name(ch, "")
+        if "HIRAGANA" in name or "KATAKANA" in name or "CJK" in name:
+            return True
+    return False
+
+def _translate_to_english(text: str) -> str:
+    try:
+        from deep_translator import GoogleTranslator
+        translated = GoogleTranslator(source="ja", target="en").translate(text)
+        print(f"[flux-api] Translated: '{text[:40]}' -> '{translated[:80]}'", flush=True)
+        return translated
+    except Exception as e:
+        print(f"[flux-api] Translation failed: {e}", flush=True)
+        return text
+
+# ---- ワーカープール ----
+_worker_pool: queue.Queue = queue.Queue()
+_num_pipes = 0
+_pool_ready = threading.Event()
 
 
-def load_pipeline():
-    """FLUXパイプラインをロード（マルチGPU分散）"""
-    global _pipe
-    if _pipe is not None:
-        return _pipe
-
+def _load_pipeline(pipe_id: int, gpu_ids: list):
+    """指定GPU群にパイプラインをロード"""
     from diffusers import FluxPipeline
 
-    num_gpus = torch.cuda.device_count()
-    print(f"[flux-api] Loading {MODEL_ID} (quant={QUANTIZATION}) on {num_gpus} GPU(s)...", flush=True)
+    print(f"[flux-api] Pipeline {pipe_id}: Loading on GPU{gpu_ids} (full bf16)...", flush=True)
 
-    max_memory = {i: "18GB" for i in range(num_gpus)}
+    # 各GPUに均等分散（2GPUで~34GB → 各17GB）
+    max_memory = {i: "17GB" for i in gpu_ids}
     max_memory["cpu"] = "32GB"
 
-    if QUANTIZATION == "none":
-        _pipe = FluxPipeline.from_pretrained(
-            MODEL_ID,
-            torch_dtype=torch.bfloat16,
-            device_map="balanced",
-            max_memory=max_memory,
-        )
-    elif QUANTIZATION == "fp8":
-        from optimum.quanto import freeze, qfloat8, quantize
-        from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
-        transformer = FluxTransformer2DModel.from_pretrained(
-            MODEL_ID, subfolder="transformer", torch_dtype=torch.bfloat16,
-        )
-        quantize(transformer, weights=qfloat8)
-        freeze(transformer)
-        _pipe = FluxPipeline.from_pretrained(
-            MODEL_ID, transformer=transformer, torch_dtype=torch.bfloat16,
-            device_map="balanced", max_memory=max_memory,
-        )
-    else:
-        raise ValueError(f"Unsupported QUANTIZATION: {QUANTIZATION}")
+    pipe = FluxPipeline.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.bfloat16,
+        device_map="balanced",
+        max_memory=max_memory,
+    )
 
-    print("[flux-api] Pipeline ready.", flush=True)
-    return _pipe
+    used = sum(torch.cuda.memory_allocated(i) for i in gpu_ids) / 1e9
+    print(f"[flux-api] Pipeline {pipe_id}: Ready. Total VRAM used: {used:.1f}GB across GPU{gpu_ids}", flush=True)
+    return pipe
 
 
-def parse_size(size: Optional[str]):
-    """'1024x1024' → (1024, 1024)。未指定や不正値は1024x1024"""
+def initialize_workers():
+    global _num_pipes
+    total_gpus = torch.cuda.device_count()
+
+    # GPU割り当て: [0,1], [2,3] の2パイプライン（GPU4は余り・バッファ）
+    gpu_groups = []
+    for i in range(0, total_gpus - 1, NUM_GPUS_PER_PIPE):
+        group = list(range(i, min(i + NUM_GPUS_PER_PIPE, total_gpus)))
+        if len(group) == NUM_GPUS_PER_PIPE:
+            gpu_groups.append(group)
+
+    _num_pipes = len(gpu_groups)
+    print(f"[flux-api] Initializing {_num_pipes} pipeline(s) on {total_gpus} GPUs...", flush=True)
+    print(f"[flux-api] GPU groups: {gpu_groups}", flush=True)
+
+    for pipe_id, gpu_ids in enumerate(gpu_groups):
+        pipe = _load_pipeline(pipe_id, gpu_ids)
+        _worker_pool.put((pipe_id, pipe))
+
+    print(f"[flux-api] All {_num_pipes} pipelines ready. Max concurrent requests: {_num_pipes}", flush=True)
+    _pool_ready.set()
+
+
+def _parse_size(size: Optional[str]):
     if not size or "x" not in size:
         return 1024, 1024
     try:
         w, h = size.lower().split("x")
-        w, h = int(w), int(h)
-        # FLUXは16の倍数推奨、極端な値はクランプ
-        w = max(256, min(2048, (w // 16) * 16))
-        h = max(256, min(2048, (h // 16) * 16))
+        w = max(256, min(2048, (int(w) // 16) * 16))
+        h = max(256, min(2048, (int(h) // 16) * 16))
         return w, h
     except Exception:
         return 1024, 1024
 
 
+# ---- FastAPI ----
 app = FastAPI(title="FLUX.1 Images API")
 
 
@@ -95,43 +143,59 @@ class ImageRequest(BaseModel):
     size: Optional[str] = "1024x1024"
     response_format: Optional[str] = "b64_json"
     model: Optional[str] = None
-    # 拡張パラメータ（任意）
     steps: Optional[int] = None
     guidance: Optional[float] = None
     seed: Optional[int] = None
 
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "model": MODEL_ID, "loaded": _pipe is not None}
+def health(auth=Security(verify_api_key)):
+    available = _worker_pool.qsize()
+    return {
+        "status": "ok",
+        "model": MODEL_ID,
+        "quantization": "none (full bf16)",
+        "total_pipelines": _num_pipes,
+        "available_pipelines": available,
+        "busy_pipelines": _num_pipes - available,
+    }
 
 
 @app.get("/v1/models")
-def list_models():
-    # Open WebUIがモデル一覧を引く場合に備える
+def list_models(auth=Security(verify_api_key)):
     return {"object": "list", "data": [{"id": MODEL_ID, "object": "model"}]}
 
 
 @app.post("/v1/images/generations")
-def generate(req: ImageRequest):
+def generate(req: ImageRequest, auth=Security(verify_api_key)):
     if not req.prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
+    if not _pool_ready.is_set():
+        raise HTTPException(status_code=503, detail="Pipelines not ready yet")
 
-    pipe = load_pipeline()
-    width, height = parse_size(req.size)
-    steps = req.steps or DEFAULT_STEPS
+    prompt = req.prompt
+    if _is_japanese(prompt):
+        print("[flux-api] Japanese prompt detected, translating...", flush=True)
+        prompt = _translate_to_english(prompt)
+
+    width, height = _parse_size(req.size)
+    steps    = req.steps    or DEFAULT_STEPS
     guidance = req.guidance or DEFAULT_GUID
-    n = max(1, min(req.n or 1, 8))  # 上限8枚
+    n        = max(1, min(req.n or 1, 8))
 
-    print(f"[flux-api] generate: '{req.prompt[:50]}...' size={width}x{height} n={n} steps={steps}", flush=True)
+    print(f"[flux-api] generate: '{prompt[:80]}' "
+          f"size={width}x{height} n={n} steps={steps} "
+          f"(pipelines available: {_worker_pool.qsize()}/{_num_pipes})", flush=True)
 
-    results = []
-    with _gen_lock:
+    # 空きパイプラインを取得（なければ待機）
+    pipe_id, pipe = _worker_pool.get()
+    try:
+        results = []
         for i in range(n):
-            seed = (req.seed if req.seed is not None else int(time.time())) + i
-            gen = torch.Generator("cpu").manual_seed(seed)
+            s = (req.seed if req.seed is not None else int(time.time())) + i
+            gen = torch.Generator("cpu").manual_seed(s)
             image = pipe(
-                prompt=req.prompt,
+                prompt=prompt,
                 height=height,
                 width=width,
                 guidance_scale=guidance,
@@ -142,14 +206,15 @@ def generate(req: ImageRequest):
 
             buf = io.BytesIO()
             image.save(buf, format="PNG")
-            b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-            results.append({"b64_json": b64})
+            results.append({"b64_json": base64.b64encode(buf.getvalue()).decode()})
 
-    return JSONResponse({"created": int(time.time()), "data": results})
+        return JSONResponse({"created": int(time.time()), "data": results})
+    finally:
+        _worker_pool.put((pipe_id, pipe))
 
 
 if __name__ == "__main__":
     import uvicorn
-    # 起動時にモデルを事前ロード（初回リクエストのタイムアウト回避）
-    load_pipeline()
+    init_thread = threading.Thread(target=initialize_workers, daemon=True)
+    init_thread.start()
     uvicorn.run(app, host="0.0.0.0", port=API_PORT)
