@@ -3,9 +3,9 @@ import base64
 
 url = "https://garbage-caviar-expert.ngrok-free.dev/v1/images/generations"
 data = {
-    "prompt": "カレーライス",
+    "prompt": "高市早苗",
     "size": "1024x1024",
-    "steps": 50
+    "steps": 20
 }
 
 response = requests.post(url, json=data, timeout=None)
