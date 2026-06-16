@@ -3,7 +3,7 @@ import base64
 
 url = "https://garbage-caviar-expert.ngrok-free.dev/v1/images/generations"
 data = {
-    "prompt": "very cute teddy bear",
+    "prompt": "カレーライス",
     "size": "1024x1024",
     "steps": 50
 }
