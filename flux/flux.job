@@ -18,7 +18,6 @@ mkdir -p .data/cache/nv
 
 export LC_ALL=C
 export DEBIAN_FRONTEND=noninteractive
-# HFキャッシュは .data/hf に集約（永続化）
 export HF_HOME="$PWD/.data/hf"
 export PATH="$PWD/.data/python/bin:$PWD/.data/bin:$PATH"
 export CUDA_HOME="/usr/local/cuda-12.1"
@@ -108,5 +107,4 @@ if [ ! -f ".data/bin/ngrok" ]; then
 fi
 
 ngrok config add-authtoken "$NGROK_AUTHTOKEN"
-# 固定URLでAPIポートを公開（Open WebUIからこのURLを指定）
 ngrok http --url=${NGROK_URL} ${FLUX_API_PORT}

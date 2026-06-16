@@ -1,12 +1,5 @@
 """
-FLUX.1-dev OpenAI Images API 互換サーバ（2並列版）
-フルbf16を2GPUに分散させたパイプラインを2本立て、
-最大2リクエストを同時処理する。
-
-A4500 20GB x5 の現実的な最大構成:
-  - パイプライン1: GPU0 + GPU1 (各~17GB使用)
-  - パイプライン2: GPU2 + GPU3 (各~17GB使用)
-  - GPU4: 予備（推論バッファ・VAE用）
+FLUX.1-dev OpenAI Images API 互換サーバ
 """
 import os
 import io
@@ -24,15 +17,12 @@ from fastapi.security import APIKeyHeader
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-# ---- 環境変数から設定 ----
-MODEL_ID      = os.environ.get("MODEL",          "black-forest-labs/FLUX.1-dev")
-DEFAULT_STEPS = int(os.environ.get("STEPS",      "50"))
+MODEL_ID      = os.environ.get("MODEL", "black-forest-labs/FLUX.1-dev")
+DEFAULT_STEPS = int(os.environ.get("STEPS", "50"))
 DEFAULT_GUID  = float(os.environ.get("GUIDANCE", "3.5"))
 API_PORT      = int(os.environ.get("FLUX_API_PORT", "9090"))
-_API_KEY      = os.environ.get("FLUX_API_KEY",   "").strip()
+_API_KEY      = os.environ.get("FLUX_API_KEY", "").strip()
 
-# 並列数: GPU数÷2（2GPUで1パイプライン）
-# GPU5枚 → 2パイプライン（GPU0+1, GPU2+3）、GPU4はバッファ
 NUM_GPUS_PER_PIPE = 2
 
 if not _API_KEY:
@@ -40,7 +30,7 @@ if not _API_KEY:
 else:
     print("[flux-api] API key authentication enabled.", flush=True)
 
-# ---- APIキー認証 ----
+# API認証
 _api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
 def verify_api_key(authorization: str = Security(_api_key_header)):
@@ -52,7 +42,7 @@ def verify_api_key(authorization: str = Security(_api_key_header)):
     if not secrets.compare_digest(token, _API_KEY):
         raise HTTPException(status_code=403, detail="Invalid API key")
 
-# ---- 日本語翻訳 ----
+# 翻訳
 def _is_japanese(text: str) -> bool:
     for ch in text:
         name = unicodedata.name(ch, "")
@@ -70,7 +60,7 @@ def _translate_to_english(text: str) -> str:
         print(f"[flux-api] Translation failed: {e}", flush=True)
         return text
 
-# ---- ワーカープール ----
+# ワーカのプール
 _worker_pool: queue.Queue = queue.Queue()
 _num_pipes = 0
 _pool_ready = threading.Event()
@@ -102,7 +92,7 @@ def initialize_workers():
     global _num_pipes
     total_gpus = torch.cuda.device_count()
 
-    # GPU割り当て: [0,1], [2,3] の2パイプライン（GPU4は余り・バッファ）
+    # GPU割り当て [0,1], [2,3]..
     gpu_groups = []
     for i in range(0, total_gpus - 1, NUM_GPUS_PER_PIPE):
         group = list(range(i, min(i + NUM_GPUS_PER_PIPE, total_gpus)))
@@ -133,7 +123,7 @@ def _parse_size(size: Optional[str]):
         return 1024, 1024
 
 
-# ---- FastAPI ----
+# FastAPI
 app = FastAPI(title="FLUX.1 Images API")
 
 
