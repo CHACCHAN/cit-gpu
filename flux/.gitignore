@@ -4,3 +4,4 @@ logs
 ngrok
 __pycache__
 *.pyc
+.flux*
