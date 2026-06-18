@@ -67,7 +67,9 @@ if [ ! -f ".data/python/.install_done" ]; then
         fastapi \
         "uvicorn[standard]" \
         "bitsandbytes>=0.43.0" \
-        deep-translator
+        deep-translator \
+        aiohttp \
+        discord
     touch .data/python/.install_done
 fi
 
@@ -96,6 +98,14 @@ done
 if [ "$STARTED" = false ]; then
     echo "ERROR: FLUX API failed to start. Check logs/flux_api.log"
     exit 1
+fi
+
+# Discord Bot
+export FLUX_API_URL="http://localhost:${FLUX_API_PORT}"
+export DISCORD_TOKEN="${DISCORD_TOKEN:-}"
+if ! pgrep -f "bot.py" > /dev/null; then
+    .data/python/bin/python3 bot.py > logs/discord_bot.log 2>&1 &
+    echo "Discord Bot started. Log: logs/discord_bot.log"
 fi
 
 # ngrok

@@ -82,6 +82,7 @@ def _load_pipeline(pipe_id: int, gpu_ids: list):
         device_map="balanced",
         max_memory=max_memory,
     )
+    pipe.safety_checker = None
 
     used = sum(torch.cuda.memory_allocated(i) for i in gpu_ids) / 1e9
     print(f"[flux-api] Pipeline {pipe_id}: Ready. Total VRAM used: {used:.1f}GB across GPU{gpu_ids}", flush=True)
