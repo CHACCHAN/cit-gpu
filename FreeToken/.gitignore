@@ -1,5 +1,6 @@
 .hf-cache/*
 .venv/*
+bin/*
 logs/*
 models/*
 .env

@@ -1,6 +1,0 @@
-logs
-.data
-.sglang*
-.webui_secret_key
-.env
-ngrok
