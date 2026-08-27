@@ -1,0 +1,6 @@
+.hf-cache/*
+.venv/*
+logs/*
+models/*
+.env
+!.env.example
