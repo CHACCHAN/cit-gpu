@@ -1,0 +1,178 @@
+#!/bin/bash
+
+#SBATCH --partition=research
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --gpus-per-task=2
+#SBATCH --mem=256G
+#SBATCH --time=24:00:00
+#SBATCH --container=pytorch/pytorch:2.11.0-cuda13.0-cudnn9-devel
+#SBATCH --output=logs/%j.log
+#SBATCH --error=logs/%j.err
+
+# TP=2 の rank 間転送に /dev/shm が必要。サイト既定の 16G では足りない
+#CONTAINER --shm-size=32G
+
+set -euo pipefail
+
+WORKDIR="${SLURM_SUBMIT_DIR:-$PWD}"
+ENV_FILE="${ENV_FILE:-$WORKDIR/.env}"
+
+set -a
+source "$ENV_FILE"
+set +a
+
+: "${SG_MODEL_REPO:?SG_MODEL_REPO is required}"
+: "${SG_MODEL:?SG_MODEL is required}"
+: "${SG_SERVED_MODEL_NAME:?SG_SERVED_MODEL_NAME is required}"
+: "${SG_HOST:?SG_HOST is required}"
+: "${SG_PORT:?SG_PORT is required}"
+: "${SG_API_KEY:?SG_API_KEY is required}"
+: "${SG_TP_SIZE:?SG_TP_SIZE is required}"
+: "${SG_MOE_RUNNER_BACKEND:?SG_MOE_RUNNER_BACKEND is required}"
+: "${SG_CONTEXT_LENGTH:?SG_CONTEXT_LENGTH is required}"
+: "${SG_MEM_FRACTION_STATIC:?SG_MEM_FRACTION_STATIC is required}"
+: "${SG_MAX_RUNNING_REQUESTS:?SG_MAX_RUNNING_REQUESTS is required}"
+: "${SG_CHUNKED_PREFILL_SIZE:?SG_CHUNKED_PREFILL_SIZE is required}"
+: "${SG_CUDA_GRAPH_MAX_BS:?SG_CUDA_GRAPH_MAX_BS is required}"
+: "${SG_WEIGHT_LOAD_THREADS:?SG_WEIGHT_LOAD_THREADS is required}"
+: "${SG_REASONING_PARSER:?SG_REASONING_PARSER is required}"
+: "${SG_TOOL_CALL_PARSER:?SG_TOOL_CALL_PARSER is required}"
+: "${TUNNEL_TOKEN:?TUNNEL_TOKEN is required}"
+
+resolve_path() {
+    if [[ "$1" = /* ]]; then
+        printf '%s\n' "$1"
+    else
+        printf '%s/%s\n' "$WORKDIR" "$1"
+    fi
+}
+
+MODEL_PATH="$(resolve_path "$SG_MODEL")"
+SG_VENV="$(resolve_path ".venv")"
+HF_HOME="$(resolve_path ".hf-cache")"
+CLOUDFLARED="$(resolve_path "bin/cloudflared")"
+
+export HF_HOME
+export HF_HUB_DISABLE_TELEMETRY=1
+export TOKENIZERS_PARALLELISM=false
+export PYTHONUNBUFFERED=1
+export PIP_NO_CACHE_DIR=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+mkdir -p "$HF_HOME"
+
+nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader || true
+
+# CloudFlare Tunnel
+if [[ ! -x "$CLOUDFLARED" ]]; then
+    mkdir -p "$(dirname "$CLOUDFLARED")"
+
+python3 - "$CLOUDFLARED" <<'PY'
+import sys
+import urllib.request
+url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+dest = sys.argv[1]
+print(f"Downloading cloudflared -> {dest}")
+req = urllib.request.Request(
+    url,
+    headers={"User-Agent": "SGLang-Slurm"}
+)
+
+with urllib.request.urlopen(req) as response, open(dest, "wb") as f:
+    while chunk := response.read(1024 * 1024):
+        f.write(chunk)
+PY
+
+    chmod +x "$CLOUDFLARED"
+fi
+
+"$CLOUDFLARED" tunnel \
+    --no-autoupdate \
+    --loglevel info \
+    run &
+
+CLOUDFLARED_PID=$!
+
+echo "cloudflared started: PID=$CLOUDFLARED_PID"
+
+# SGLang の仮想環境
+# pytorch イメージには python3-venv が無いので pip の virtualenv を使う。
+# --system-site-packages は付けない (sglang は torch==2.13.0 固定、
+# イメージは 2.11.0 なので共有すると torch が二重化する)
+if [[ ! -x "$SG_VENV/bin/sglang" ]]; then
+    python3 -m pip install \
+        --break-system-packages \
+        --no-cache-dir \
+        virtualenv
+
+    python3 -m virtualenv "$SG_VENV"
+
+    "$SG_VENV/bin/python" -m pip install \
+        --no-cache-dir \
+        "${SG_PACKAGE:-sglang==0.5.18}"
+fi
+
+"$SG_VENV/bin/python" -c 'import sglang, torch; print(f"sglang {sglang.__version__} / torch {torch.__version__} (cuda {torch.version.cuda})")'
+
+# モデルが存在しなければ Hugging Face から取得
+# encoding/encoding_dsv4.py は sglang が reasoning-effort の判定に読むので必須
+if [[ ! -f "$MODEL_PATH/config.json" || ! -f "$MODEL_PATH/encoding/encoding_dsv4.py" ]]; then
+    echo "Downloading model: $SG_MODEL_REPO"
+    echo "Destination: $MODEL_PATH"
+
+    mkdir -p "$MODEL_PATH"
+
+    # huggingface_hub は venv 側にある (土台イメージには入っていない)
+    "$SG_VENV/bin/python" - "$SG_MODEL_REPO" "$MODEL_PATH" <<'PY'
+import sys
+from huggingface_hub import snapshot_download
+
+repo_id = sys.argv[1]
+local_dir = sys.argv[2]
+
+snapshot_download(
+    repo_id=repo_id,
+    local_dir=local_dir,
+)
+PY
+fi
+
+if [[ ! -f "$MODEL_PATH/config.json" ]]; then
+    echo "ERROR: $MODEL_PATH/config.json not found"
+    exit 1
+fi
+
+cleanup() {
+    if [[ -n "${CLOUDFLARED_PID:-}" ]]; then
+        kill "$CLOUDFLARED_PID" 2>/dev/null || true
+    fi
+}
+
+trap cleanup EXIT INT TERM
+
+# 以下は渡さない。sglang が DeepseekV4ForCausalLM から自動で決めるため、
+# 上書きすると壊れる:
+#   --attention-backend -> dsv4 / --page-size -> 256
+#   --kv-cache-dtype -> fp8_e4m3 / --quantization -> config.json 由来
+"$SG_VENV/bin/sglang" serve \
+    --model-path "$MODEL_PATH" \
+    --served-model-name "$SG_SERVED_MODEL_NAME" \
+    --host "$SG_HOST" \
+    --port "$SG_PORT" \
+    --api-key "$SG_API_KEY" \
+    --tp-size "$SG_TP_SIZE" \
+    --moe-runner-backend "$SG_MOE_RUNNER_BACKEND" \
+    --context-length "$SG_CONTEXT_LENGTH" \
+    --mem-fraction-static "$SG_MEM_FRACTION_STATIC" \
+    --max-running-requests "$SG_MAX_RUNNING_REQUESTS" \
+    --chunked-prefill-size "$SG_CHUNKED_PREFILL_SIZE" \
+    --cuda-graph-max-bs-decode "$SG_CUDA_GRAPH_MAX_BS" \
+    --model-loader-extra-config "{\"num_threads\": $SG_WEIGHT_LOAD_THREADS}" \
+    --weight-loader-drop-cache-after-load \
+    --reasoning-parser "$SG_REASONING_PARSER" \
+    --tool-call-parser "$SG_TOOL_CALL_PARSER" \
+    --allow-auto-truncate \
+    --enable-hierarchical-cache \
+    --hicache-ratio 2
