@@ -4,4 +4,5 @@ bin/*
 logs/*
 models/*
 .env
+.env.*
 !.env.example
