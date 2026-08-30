@@ -38,6 +38,7 @@ set +a
 #   --attention-backend -> dsv4 / --page-size -> 256
 #   --kv-cache-dtype -> fp8_e4m3 / --quantization -> config.json 由来
 ARGS=(
+    --dist-timeout "${SG_DIST_TIMEOUT:-600}"
     --moe-runner-backend "${SG_MOE_RUNNER_BACKEND:?}"
     --enable-hierarchical-cache
     --hicache-ratio 2
