@@ -13,262 +13,64 @@
 
 ##CONTAINER --shm-size=64G
 
-set -euo pipefail
+# 新習志野 (gpumng, RTX A4500 20GB x4) / Qwen3.8-27B-AWQ-INT4 / TP=4
+# 共通パイプラインは src/launch.py。ここにはサイト固有の差分だけを書く。
 
-WORKDIR="${SLURM_SUBMIT_DIR:-$PWD}"
-ENV_FILE="${ENV_FILE:-$WORKDIR/.env}"
+set -euo pipefail
+cd "${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")" && pwd)}"
 
 set -a
-source "$ENV_FILE"
+source "${ENV_FILE:-.env}"
 set +a
 
-for v in SG_MODEL_REPO SG_MODEL SG_SERVED_MODEL_NAME SG_HOST SG_PORT SG_API_KEY \
-         SG_TP_SIZE SG_CONTEXT_LENGTH SG_MEM_FRACTION_STATIC \
-         SG_MAX_RUNNING_REQUESTS SG_MAX_QUEUED_REQUESTS SG_CHUNKED_PREFILL_SIZE \
-         SG_CUDA_GRAPH_MAX_BS SG_MAMBA_SSM_DTYPE SG_MAMBA_RADIX_CACHE_STRATEGY \
-         SG_MAMBA_FULL_MEMORY_RATIO SG_WEIGHT_LOAD_THREADS \
-         SG_REASONING_PARSER SG_TOOL_CALL_PARSER; do
-    [[ -n "${!v:-}" ]] || { echo "ERROR: $v is required in $ENV_FILE"; exit 1; }
-done
+# 素のノード (コンテナ不使用) なので pip wheel の CUDA toolchain 補正が要る
+export SG_CUDA_FIXUPS="${SG_CUDA_FIXUPS:-1}"
 
-SG_ATTENTION_BACKEND="${SG_ATTENTION_BACKEND:-}"
-SG_SAMPLING_BACKEND="${SG_SAMPLING_BACKEND:-}"
-SG_ENABLE_HICACHE="${SG_ENABLE_HICACHE:-0}"
-SG_HICACHE_SIZE="${SG_HICACHE_SIZE:-40}"
-SG_HICACHE_WRITE_POLICY="${SG_HICACHE_WRITE_POLICY:-write_through}"
-SG_DIST_TIMEOUT="${SG_DIST_TIMEOUT:-600}"
-SG_DIST_INIT_ADDR="${SG_DIST_INIT_ADDR:-}"
-TUNNEL_TOKEN="${TUNNEL_TOKEN:-}"
-
-resolve_path() {
-    if [[ "$1" = /* ]]; then printf '%s\n' "$1"; else printf '%s/%s\n' "$WORKDIR" "$1"; fi
-}
-
-MODEL_PATH="$(resolve_path "$SG_MODEL")"
-SG_VENV="$(resolve_path ".venv")"
-HF_HOME="$(resolve_path ".hf-cache")"
-CLOUDFLARED="$(resolve_path "bin/cloudflared")"
-
-export HF_HOME
-export HF_HUB_DISABLE_TELEMETRY=1
-export TOKENIZERS_PARALLELISM=false
-export PYTHONUNBUFFERED=1
-export PIP_NO_CACHE_DIR=1
-# CUDA graph の捕獲に失敗する場合はこの行を外す
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
-mkdir -p "$HF_HOME"
-
-echo "job ${SLURM_JOB_ID:-local} on $(hostname) / tp=$SG_TP_SIZE ctx=$SG_CONTEXT_LENGTH"
-echo "running=$SG_MAX_RUNNING_REQUESTS queued=$SG_MAX_QUEUED_REQUESTS hicache=$SG_ENABLE_HICACHE"
-if [[ "$SG_ENABLE_HICACHE" == "1" ]]; then
-    echo "hicache ${SG_HICACHE_SIZE}GB/rank = $((SG_HICACHE_SIZE * SG_TP_SIZE))GB total"
+# このノード群は GPU 間 P2P (CUDA IPC) が壊れた個体を含む。壊れた GPU へ
+# P2P で書くとエラーも出さずゼロが返り、NCCL の all_reduce が永久に返らない
+# (src/p2p_check.py で確認できる。詳細は README「分散初期化のハング」)。
+# P2P を切って NCCL を共有メモリ経由に落とす。サイト側で直ったら .env で 0 に。
+SG_NCCL_P2P_DISABLE="${SG_NCCL_P2P_DISABLE:-1}"
+if [[ "$SG_NCCL_P2P_DISABLE" == "1" ]]; then
+    export NCCL_P2P_DISABLE=1
 fi
 
-nvidia-smi --query-gpu=index,name,memory.total,driver_version,compute_cap --format=csv || true
-free -g | head -2 || true
-quota -s 2>/dev/null | tail -1 || true
-df -h /dev/shm || true
-
-# ---------------------------------------------------------------------------
-# Cloudflare Tunnel (token は cloudflared が環境変数から直接読む)
-# ---------------------------------------------------------------------------
-CLOUDFLARED_PID=""
-
-if [[ -n "$TUNNEL_TOKEN" ]]; then
-    if [[ ! -x "$CLOUDFLARED" ]]; then
-        mkdir -p "$(dirname "$CLOUDFLARED")"
-
-python3 - "$CLOUDFLARED" <<'PY'
-import sys
-import urllib.request
-url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-dest = sys.argv[1]
-print(f"Downloading cloudflared -> {dest}")
-req = urllib.request.Request(url, headers={"User-Agent": "SGLang-Slurm"})
-with urllib.request.urlopen(req) as response, open(dest, "wb") as f:
-    while chunk := response.read(1024 * 1024):
-        f.write(chunk)
-PY
-
-        chmod +x "$CLOUDFLARED"
-    fi
-
-    "$CLOUDFLARED" tunnel --no-autoupdate --loglevel info run &
-    CLOUDFLARED_PID=$!
-    echo "cloudflared started: PID=$CLOUDFLARED_PID"
-else
-    echo "TUNNEL_TOKEN empty -> cloudflared not started (cluster-internal only)"
-fi
-
-cleanup() {
-    if [[ -n "${CLOUDFLARED_PID:-}" ]]; then
-        kill "$CLOUDFLARED_PID" 2>/dev/null || true
-    fi
-}
-trap cleanup EXIT INT TERM
-
-# ---------------------------------------------------------------------------
-# venv
-# --system-site-packages は付けない (sglang は torch==2.13.0 を固定するため)
-# ---------------------------------------------------------------------------
-if [[ ! -x "$SG_VENV/bin/sglang" ]]; then
-    # 素の Ubuntu 24.04 ノードは python3-venv 未導入で ensurepip が無い
-    if python3 -c 'import ensurepip' 2>/dev/null; then
-        python3 -m venv "$SG_VENV"
-    else
-        python3 -m pip install --break-system-packages --no-cache-dir virtualenv
-        python3 -m virtualenv "$SG_VENV"
-    fi
-
-    "$SG_VENV/bin/python" -m pip install --no-cache-dir --upgrade pip
-    "$SG_VENV/bin/python" -m pip install --no-cache-dir "${SG_PACKAGE:-sglang==0.5.18}"
-
-    # 素の依存解決では nvcc が 13.3.73 まで上がり、13.0.96 のままの
-    # nvidia-cuda-runtime とズレて flashinfer の JIT が全滅する
-    # ("CUDA compiler and CUDA toolkit headers are incompatible")。
-    # cuda-toolkit 13.0.3.0 が要求する組み合わせへ戻す。
-    "$SG_VENV/bin/python" -m pip install --no-cache-dir \
-        "nvidia-cuda-nvcc==13.0.88.*" \
-        "nvidia-cuda-crt==13.0.88.*" \
-        "nvidia-nvvm==13.0.88.*"
-fi
-
-SG_PYVER="$("$SG_VENV/bin/python" -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')"
-SG_CU="$SG_VENV/lib/$SG_PYVER/site-packages/nvidia/cu13"
-
-# ninja / nvcc は JIT から subprocess で呼ばれるので PATH に要る
-export PATH="$SG_VENV/bin:$SG_CU/bin:$PATH"
-export CUDA_HOME="$SG_CU"
-export LD_LIBRARY_PATH="$SG_CU/lib:${LD_LIBRARY_PATH:-}"
-
-# JIT は -L$CUDA_HOME/lib64 -lcudart / -L$CUDA_HOME/lib64/stubs -lcuda でリンクするが、
-# pip wheel には lib64/ も libcudart.so も libcuda.so も無い
-if [[ -d "$SG_CU/lib" ]]; then
-    mkdir -p "$SG_CU/lib64/stubs"
-    for so in "$SG_CU"/lib/*.so.*; do
-        [[ -e "$so" ]] || continue
-        base="$(basename "$so")"
-        ln -sf "../lib/$base" "$SG_CU/lib64/${base%%.so.*}.so"
-    done
-    for cand in /usr/lib/x86_64-linux-gnu/libcuda.so.1 /usr/local/cuda/lib64/stubs/libcuda.so; do
-        if [[ -e "$cand" ]]; then
-            ln -sfn "$cand" "$SG_CU/lib64/stubs/libcuda.so"
-            break
-        fi
-    done
-fi
-
-"$SG_VENV/bin/python" -c 'import sglang, torch; print(f"sglang {sglang.__version__} / torch {torch.__version__} (cuda {torch.version.cuda})")'
-nvcc --version | tail -1
-
-# ---------------------------------------------------------------------------
-# モデル取得
-# snapshot_download(local_dir=...) は blob を HF_HOME 側に置かない。
-# models/ と .hf-cache/ の二重保存を避けるため (quota 80GB)。
-# ---------------------------------------------------------------------------
-if [[ ! -f "$MODEL_PATH/config.json" || ! -f "$MODEL_PATH/chat_template.jinja" ]]; then
-    echo "Downloading model: $SG_MODEL_REPO -> $MODEL_PATH"
-    mkdir -p "$MODEL_PATH"
-
-    "$SG_VENV/bin/python" - "$SG_MODEL_REPO" "$MODEL_PATH" <<'PY'
-import sys
-from huggingface_hub import snapshot_download
-snapshot_download(repo_id=sys.argv[1], local_dir=sys.argv[2])
-PY
-fi
-
-[[ -f "$MODEL_PATH/config.json" ]] || { echo "ERROR: $MODEL_PATH/config.json not found"; exit 1; }
-
-du -sh "$MODEL_PATH" "$SG_VENV" || true
-
-# ---------------------------------------------------------------------------
-# 起動
+# serve へのサイト固有引数。共通分は src/serve.py の base_args()。
 # 渡していないもの:
 #   --quantization      config.json から compressed-tensors が自動で読まれる
 #   --moe-runner-backend Qwen3.8-27B は dense (MoE は無い)
 #   --kv-cache-dtype    checkpoint が宣言しないので auto=bf16
 #   --page-size         hybrid GDN の既定 1 のまま
 #   speculative / MTP   最初は使わない
-# ---------------------------------------------------------------------------
-SG_ARGS=(
-    --model-path "$MODEL_PATH"
-    --served-model-name "$SG_SERVED_MODEL_NAME"
-    --host "$SG_HOST"
-    --port "$SG_PORT"
-    --api-key "$SG_API_KEY"
-    --tp-size "$SG_TP_SIZE"
-    --dist-timeout "$SG_DIST_TIMEOUT"
-    --context-length "$SG_CONTEXT_LENGTH"
-    --mem-fraction-static "$SG_MEM_FRACTION_STATIC"
-    --max-running-requests "$SG_MAX_RUNNING_REQUESTS"
-    --max-queued-requests "$SG_MAX_QUEUED_REQUESTS"
-    --chunked-prefill-size "$SG_CHUNKED_PREFILL_SIZE"
-    --cuda-graph-max-bs-decode "$SG_CUDA_GRAPH_MAX_BS"
-    --mamba-ssm-dtype "$SG_MAMBA_SSM_DTYPE"
-    --mamba-radix-cache-strategy "$SG_MAMBA_RADIX_CACHE_STRATEGY"
-    --mamba-full-memory-ratio "$SG_MAMBA_FULL_MEMORY_RATIO"
-    --model-loader-extra-config "{\"num_threads\": $SG_WEIGHT_LOAD_THREADS}"
-    --weight-loader-drop-cache-after-load
-    --reasoning-parser "$SG_REASONING_PARSER"
-    --tool-call-parser "$SG_TOOL_CALL_PARSER"
-    --allow-auto-truncate
+ARGS=(
+    --dist-timeout "${SG_DIST_TIMEOUT:-600}"
+    --max-queued-requests "${SG_MAX_QUEUED_REQUESTS:?}"
+    --mamba-ssm-dtype "${SG_MAMBA_SSM_DTYPE:?}"
+    --mamba-radix-cache-strategy "${SG_MAMBA_RADIX_CACHE_STRATEGY:?}"
+    --mamba-full-memory-ratio "${SG_MAMBA_FULL_MEMORY_RATIO:?}"
     --enable-metrics
 )
 
-if [[ -n "$SG_DIST_INIT_ADDR" ]]; then
-    SG_ARGS+=(--dist-init-addr "$SG_DIST_INIT_ADDR")
+# custom all-reduce は NCCL を通さず自前で CUDA IPC を張るので、
+# NCCL_P2P_DISABLE では避けられない。P2P を切るときは一緒に無効化する
+if [[ "$SG_NCCL_P2P_DISABLE" == "1" ]]; then
+    ARGS+=(--disable-custom-all-reduce)
 fi
-if [[ -n "$SG_ATTENTION_BACKEND" ]]; then
-    SG_ARGS+=(--attention-backend "$SG_ATTENTION_BACKEND")
+if [[ -n "${SG_DIST_INIT_ADDR:-}" ]]; then
+    ARGS+=(--dist-init-addr "$SG_DIST_INIT_ADDR")
 fi
-if [[ -n "$SG_SAMPLING_BACKEND" ]]; then
-    SG_ARGS+=(--sampling-backend "$SG_SAMPLING_BACKEND")
+if [[ -n "${SG_ATTENTION_BACKEND:-}" ]]; then
+    ARGS+=(--attention-backend "$SG_ATTENTION_BACKEND")
 fi
-
-if [[ "$SG_ENABLE_HICACHE" == "1" ]]; then
-    SG_ARGS+=(
+if [[ -n "${SG_SAMPLING_BACKEND:-}" ]]; then
+    ARGS+=(--sampling-backend "$SG_SAMPLING_BACKEND")
+fi
+if [[ "${SG_ENABLE_HICACHE:-0}" == "1" ]]; then
+    ARGS+=(
         --enable-hierarchical-cache
-        --hicache-size "$SG_HICACHE_SIZE"
-        --hicache-write-policy "$SG_HICACHE_WRITE_POLICY"
+        --hicache-size "${SG_HICACHE_SIZE:-40}"
+        --hicache-write-policy "${SG_HICACHE_WRITE_POLICY:-write_through}"
     )
 fi
 
-# 起動ウォッチドッグ。
-# このクラスタは 4GPU ジョブの分散初期化が一定確率でハングする
-# (素の torchrun でも再現。job 14175 が hang / 14176 が同条件で成功)。
-# ハングすると nccl 版数を出したまま無限に止まるので、READY まで
-# SG_STARTUP_TIMEOUT 秒待って駄目なら殺して張り直す。
-SG_STARTUP_TIMEOUT="${SG_STARTUP_TIMEOUT:-900}"
-SG_STARTUP_RETRIES="${SG_STARTUP_RETRIES:-5}"
-
-for attempt in $(seq 1 "$SG_STARTUP_RETRIES"); do
-    "$SG_VENV/bin/sglang" serve "${SG_ARGS[@]}" &
-    SG_PID=$!
-
-    ready=0
-    for _ in $(seq 1 "$((SG_STARTUP_TIMEOUT / 5))"); do
-        if ! kill -0 "$SG_PID" 2>/dev/null; then break; fi
-        if curl -sf -m 3 -H "Authorization: Bearer $SG_API_KEY" \
-               "http://127.0.0.1:$SG_PORT/health" >/dev/null 2>&1; then
-            ready=1
-            break
-        fi
-        sleep 5
-    done
-
-    if [[ "$ready" == "1" ]]; then
-        echo "server ready (attempt $attempt)"
-        wait "$SG_PID"
-        exit $?
-    fi
-
-    echo "startup did not reach ready within ${SG_STARTUP_TIMEOUT}s (attempt $attempt); restarting"
-    pkill -P "$SG_PID" 2>/dev/null || true
-    kill -9 "$SG_PID" 2>/dev/null || true
-    pkill -9 -u "$USER" -f "sglang::" 2>/dev/null || true
-    sleep 20
-done
-
-echo "ERROR: server failed to start after $SG_STARTUP_RETRIES attempts"
-exit 1
+exec python3 -u src/launch.py --marker chat_template.jinja -- "${ARGS[@]}"

@@ -4,7 +4,24 @@
 SGLang を動かし、OpenAI 互換 API を CodeAgent 向けに提供する。
 津田沼 (`gpumng2`, H100 NVL x2) の DeepSeek-V4-Flash 構成からの移行。
 
-`sglang.shinnarashino` 1ファイルで完結。設定は `.env` のみ。
+ジョブファイル (`sglang.shinnarashino` / `sglang.tsudanuma`) を sbatch する。
+`src/` は両サイト共通の汎用パイプライン (Python)。サイト差分 (必須変数・
+環境変数・serve 追加引数) はジョブファイル側の bash で組み立てて流し込む:
+
+```
+python3 -u src/launch.py [--marker FILE]... [--dry-run] -- [serve 追加引数...]
+```
+設定は `.env` のみ。
+
+| パス | 役割 |
+|---|---|
+| `sglang.shinnarashino` / `sglang.tsudanuma` | sbatch するジョブファイル。`#SBATCH` / .env の source / サイト固有の env と serve 引数 / launch.py の exec |
+| `src/launch.py` | 汎用パイプライン: 検証 → Tunnel → venv → モデル取得 → serve。`--dry-run` で serve 直前まで流して引数を表示 |
+| `src/tunnel.py` | Cloudflare Tunnel (`TUNNEL_TOKEN` が空ならスキップ) |
+| `src/venvsetup.py` | venv 構築 / CUDA toolchain 補正 (`SG_CUDA_FIXUPS=1`) / ログノイズの後始末 (`patch_sarashina()` 含む) |
+| `src/modelfetch.py` | モデル取得 |
+| `src/serve.py` | 共通 serve 引数 + 起動ウォッチドッグ |
+| `src/p2pdiag.py` ほか | 診断ツール (p2p_check / dist_smoke / sweep)。ジョブからは使わない |
 
 ## 使い方
 
@@ -16,6 +33,10 @@ tail -f logs/<jobid>.err  # sglang のログは stderr
 ```
 
 初回は venv 作成 (約8分 / 8.9GB) とモデル取得 (20GB) が走る。
+READY までの時間は triton の JIT キャッシュが温まっているかで大きく変わる。
+コールド (venv 作り直し後など) は約14分 (実測 835s / job 14288、うち
+prefill CUDA graph capture が 441s)。ウォームなら約3分 (185s / job 14299、
+同 capture 26s)。`SG_STARTUP_TIMEOUT` はコールドを基準に取ること。
 `The server is fired up and ready to roll!` が出れば稼働。停止は `scancel <jobid>`。
 
 ジョブは `--partition=research` なので実行ノードは毎回変わる。
@@ -55,7 +76,9 @@ CodeAgent 側は `contextWindow: 262144` を指定してよい。
 
 ### venv の CUDA まわり (ここを外すと起動しない)
 
-`sglang.shinnarashino` が venv 作成後にやっている3点。どれも必須。
+`src/venvsetup.py` が venv 作成後にやっている3点 (`SG_CUDA_FIXUPS=1` のときだけ)。
+素のノードではどれも必須。コンテナには /usr/local/cuda が一式あるので不要
+(津田沼は既定 0 のまま)。
 
 1. **`nvidia-cuda-nvcc` を 13.0.88 に固定する。**
    素の依存解決では nvcc が 13.3.73 まで上がる一方 `nvidia-cuda-runtime` は
@@ -71,6 +94,41 @@ CodeAgent 側は `contextWindow: 262144` を指定してよい。
    flashinfer は `-lcuda` でドライバにもリンクする。
 
 `$SG_VENV/bin` を PATH に入れるのも必須 (`ninja` が subprocess で呼ばれる)。
+
+### venv の後始末 (起動ログのノイズ潰し)
+
+こちらは起動には影響しないが、放置すると `logs/*.err` が読めなくなる。
+`src/venvsetup.py` の `tidy()` として毎回走る (どちらも冪等なので既存 venv にも効く)。
+
+1. **`torchcodec` を消す。**
+   sglang の依存だがノードに FFmpeg (`libavutil.so.56`-`.so.60`) が無く、
+   `torchcodec/libtorchcodec_core{4..8}.so` の `dlopen` が5世代とも失敗する。
+   sglang は握りつぶすものの、traceback をそのまま WARNING に埋め込むため
+   `mimo_audio` / `mimo_v2_asr` x tokenizer+TP4 の 5 プロセスで
+   **1起動あたり約1600行 (124KB)** になる。audio/video 入力は使わないうえ、
+   `srt/utils/video_decoder.py` と `srt/utils/common.py` が
+   decord / soundfile+torchaudio へのフォールバックを持っているので、
+   消しても挙動は変わらない (video backend は decord になる)。
+   FFmpeg をノードに入れられれば本来はそちらが正しいが、root が要る。
+2. **`sarashina2_vision.py` の import を直す** (`venvsetup.py` の `patch_sarashina()`)。
+   sglang 0.5.18 のバグで `MultimodalDataItem` を
+   `managers.mm_utils` から import しているが、実体は
+   `managers.schedule_batch` にある (mm_utils が再エクスポートしているのは
+   `MultimodalInputs` だけ)。他の VL モデル (qwen2_vl 等) は
+   schedule_batch から import しているので、そちらに揃える。
+   該当行が無ければ何もしないので、upstream が直したら自動的に no-op になる。
+
+`QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING=1` も同じ理由で入れてある。
+cloudflared (quic-go) が UDP 受信バッファを 7MiB に広げようとして
+`net.core.rmem_max` (208KiB) に阻まれる警告で、sysctl は root でないと変えられない。
+実害は QUIC のスループット上限だけ。
+
+cloudflared の
+`Group ID 2200 is not between ping group 1 to 0` /
+`ICMP proxy feature is disabled` は消せない。
+`/proc/sys/net/ipv4/ping_group_range` が `1 0` (空) なので
+非 root では ICMP ソケットを作れないというだけで、
+ICMP プロキシは WARP からの ping 応答用。HTTP のトンネルには関係しない。
 
 ### コンテナを使っていない
 
@@ -135,6 +193,7 @@ sglang 0.5.18 の wheel (manylinux_2_34, cp312) がそのまま入るため、
 | traceback 無しで kill、`oom-kill` | host RAM / cgroup OOM | `SG_HICACHE_SIZE` (rank単位!) と `SG_WEIGHT_LOAD_THREADS` を下げる |
 | `Bus error` (SIGBUS) | checkpoint 消失 | home 同期の影響。`/data` へ移す |
 | NCCL タイムアウト | TP 問題 | `/dev/shm` の空きを確認 |
+| `Init torch distributed begin` の後で無音 | GPU 個体の P2P 故障 | `SG_NCCL_P2P_DISABLE=1`。`src/p2pdiag.py` で個体特定 |
 
 `sacct` は当てにならない (サイトのラッパーが終了コードを Slurm に伝えないため、
 失敗しても `COMPLETED 0:0` になることがある)。ログを見る。
@@ -150,35 +209,76 @@ INFO ログに出すため)。`logs/` は .gitignore 済みだが共有はしな
 
 ## 既知の問題
 
-- **分散初期化のハング (最優先 / 未解決)。**
+- **分散初期化のハング (原因特定済 / 回避策あり / サイト側は未修理)。**
   TP=4 のジョブが一定確率で `Init torch distributed begin` →
   `sglang is using nccl==2.29.7` を出したまま無限に停止する。
-  `--dist-timeout` を短くしてもタイムアウトせず、`NCCL_DEBUG=INFO` でも
-  NCCL のログが1行も出ないので、NCCL に入る手前で止まっている。
-  `--dist-init-addr` を明示しても変わらない。
-  **SGLang 固有ではない**: sglang を介さない素の 4GPU torchrun all_reduce でも
-  同じハングが再現する (job 14175 / 14190 が hang、14176 / 14191 は同条件で成功)。
-  ノード固有でもなく gpu02 / gpu03 の両方で起きる。
-  16:00 頃までは 4 回連続で正常起動していた (job 14164/14169/14170/14171)。
 
-  再現用の最小ジョブ:
+  **原因は GPU 個体の P2P 故障。** 特定の物理 GPU に対して
+  P2P (CUDA IPC / PCIe peer copy) で書き込むと、エラーも例外も出さずに
+  **ゼロが返る**。`cudaDeviceCanAccessPeer` は全ペアで Y を返すので、
+  NCCL はそれを信じて `Channel 00/0 : 0[0] -> 1[1] via P2P/CUMEM` の
+  ring を張り、そのまま `all_reduce` が永久に返らない。
 
-  ```bash
-  #SBATCH --partition=research --gpus-per-task=4 ...
-  cat > ar.py <<'PY'
-  import torch, torch.distributed as dist
-  dist.init_process_group("nccl")
-  r = dist.get_rank(); torch.cuda.set_device(r)
-  t = torch.ones(1024, device=f"cuda:{r}")
-  dist.all_reduce(t); print(f"rank {r} OK", flush=True)
-  PY
-  timeout 90 ./.venv/bin/torchrun --nproc_per_node=4 ar.py
+  ```
+  canAccessPeer matrix (src -> dst):   actual peer copy:
+    0: - Y Y Y                           0 -> 3: WRONG DATA sum=0.0
+    1: Y - Y Y                           1 -> 3: WRONG DATA sum=0.0
+    2: Y Y - Y                           2 -> 3: WRONG DATA sum=0.0
+    3: Y Y Y -                           それ以外: ok
   ```
 
-  暫定対応として `sglang.shinnarashino` に起動ウォッチドッグを入れてある
-  (`SG_STARTUP_TIMEOUT` 秒で READY にならなければ殺して張り直す、最大
-  `SG_STARTUP_RETRIES` 回)。恒久対応は情報システム担当への報告
-  (i-staff@chibatech.ac.jp / 内線0227) が必要。上の最小再現ジョブを添えること。
+  ノードは GPU を10枚持っていてジョブは4枚しか掴まないので、
+  **故障個体を引いたときだけ**ハングする。これが「一定確率で」「ノードを
+  変えても起きる」「16時までは4回連続で成功していた」の正体。
+  NCCL や SGLang の問題ではないし、`--dist-init-addr` や
+  `--dist-timeout` では直らない (NCCL は待っているだけなので
+  watchdog も発火しない)。
+
+  切り分け用ツール:
+
+  ```bash
+  # NCCL を介さない単一プロセスの peer copy テスト。故障個体の UUID/PCI を出す
+  srun --partition=research --nodes=1 --ntasks=1 --cpus-per-task=8 \
+       --gpus-per-task=4 --mem=64G --time=00:10:00 src/p2pdiag.py
+
+  # NCCL all_reduce だけの最小再現
+  srun ... .venv/bin/torchrun --nproc_per_node=4 src/dist_smoke.py
+
+  # 効く環境変数の総当たり
+  srun ... src/dist_smoke_sweep.py
+  ```
+
+  総当たりの結果 (2026-08-30, gpu03):
+
+  | 条件 | all_reduce |
+  |---|---|
+  | baseline | ハング |
+  | `NCCL_CUMEM_ENABLE=0` | ハング |
+  | **`NCCL_P2P_DISABLE=1`** | **成功** |
+  | `NCCL_SHM_DISABLE=1` | ハング |
+  | `NCCL_P2P_DISABLE=1` + `NCCL_CUMEM_ENABLE=0` | 成功 |
+  | `NCCL_P2P_LEVEL=SYS` | ハング |
+
+  **回避策**: `SG_NCCL_P2P_DISABLE=1` (既定)。`NCCL_P2P_DISABLE=1` を出し、
+  同時に `--disable-custom-all-reduce` を付ける
+  (custom all-reduce は NCCL を通さず自前で CUDA IPC を張るため、
+  `NCCL_P2P_DISABLE` だけでは避けられない)。
+  NCCL は共有メモリ経由 (ホスト中継) に落ちるので TP の帯域は落ちるが、
+  A4500 は NVLink が無く P2P も PCIe 経由なので差は大きくない。
+
+  **黙ってゼロが返る**以上、故障個体を掴んだまま「起動できてしまった」場合は
+  TP の出力が壊れる可能性がある。P2P を切っておくのは速度以前に正しさの問題。
+
+  サイト側の修理が必要なので情報システム担当
+  (i-staff@chibatech.ac.jp / 内線0227) へ報告すること。
+  `src/p2pdiag.py` の出力 (故障 GPU の UUID / PCI バス ID が入る) を添える。
+
+  NCCL のログは **stdout** に出る。sglang のログは stderr なので、
+  `NCCL_DEBUG=INFO` の出力は `logs/<jobid>.err` ではなく
+  `logs/<jobid>.log` 側にある (「NCCL のログが1行も出ない」の正体)。
+
+  起動ウォッチドッグ (`src/serve.py`, `SG_STARTUP_TIMEOUT` / `SG_STARTUP_RETRIES`) は
+  そのまま残してある。故障個体を引いても張り直しで別の4枚を掴める可能性がある。
 - **zombie request** (upstream sgl-project/sglang#36333 / #36876, 0.5.18 未修正)。
   クライアントが切断してもスケジューラに abort が届かず、`max_tokens` まで
   デコードし続けて running slot を占有する。`max_running_requests=4` だと
@@ -189,8 +289,9 @@ INFO ログに出すため)。`logs/` は .gitignore 済みだが共有はしな
 - `qwen3_coder` + thinking の token-0 ループ (#36537)。Qwen3.8-Flash-Next /
   SM120・SM121 の QSA sparse decode 固有で、本環境 (27B / SM86 / triton /
   speculative 無効) では再現しなかった。
-- 起動時の `libtorchcodec` / `sarashina2_vision` の import エラーは無害
-  (sglang が握りつぶす)。
+- 起動時の `libtorchcodec` / `sarashina2_vision` の import エラーは
+  2026-08-30 に潰した (「venv の後始末」参照)。どちらも無害だったが、
+  前者が `logs/*.err` の 95% を占めていた。
 
 ## SGLang の更新
 
