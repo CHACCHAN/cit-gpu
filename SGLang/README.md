@@ -193,6 +193,7 @@ sglang 0.5.18 の wheel (manylinux_2_34, cp312) がそのまま入るため、
 | traceback 無しで kill、`oom-kill` | host RAM / cgroup OOM | `SG_HICACHE_SIZE` (rank単位!) と `SG_WEIGHT_LOAD_THREADS` を下げる |
 | `Bus error` (SIGBUS) | checkpoint 消失 | home 同期の影響。`/data` へ移す |
 | NCCL タイムアウト | TP 問題 | `/dev/shm` の空きを確認 |
+| 画像リクエストで OOM (`materialize_multimodal_features`) | vision 動的確保 | vision encoder は static pool 外。`SG_MEM_FRACTION_STATIC` を下げる。`SG_IMAGE_PROCESSOR_BACKEND=pil` で前処理の cuda:0 使用 (実測1.4GiB) も止める |
 | `Init torch distributed begin` の後で無音 | GPU 個体の P2P 故障 | `SG_NCCL_P2P_DISABLE=1`。`src/p2pdiag.py` で個体特定 |
 
 `sacct` は当てにならない (サイトのラッパーが終了コードを Slurm に伝えないため、

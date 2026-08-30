@@ -68,6 +68,9 @@ fi
 if [[ -n "${SG_SAMPLING_BACKEND:-}" ]]; then
     ARGS+=(--sampling-backend "$SG_SAMPLING_BACKEND")
 fi
+if [[ -n "${SG_IMAGE_PROCESSOR_BACKEND:-}" ]]; then
+    ARGS+=(--image-processor-backend "$SG_IMAGE_PROCESSOR_BACKEND")
+fi
 if [[ "${SG_ENABLE_HICACHE:-0}" == "1" ]]; then
     ARGS+=(
         --enable-hierarchical-cache
