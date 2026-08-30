@@ -20,7 +20,10 @@
 # CUDA toolchain 補正 (SG_CUDA_FIXUPS) は不要 = 既定 0 のまま。
 
 set -euo pipefail
-cd "${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")" && pwd)}"
+# コンテナ起動はスクリプトを /tmp/slurm/startup へコピーして実行し、
+# SLURM_SUBMIT_DIR などの環境変数も渡さないので dirname "$0" は使えない。
+# cwd は submit dir (home は /root にマウント) のまま始まるので $PWD に落とす。
+cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
 set -a
 source "${ENV_FILE:-.env}"

@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -53,6 +54,26 @@ def resolve_path(workdir: Path, value: str) -> Path:
     return p if p.is_absolute() else workdir / p
 
 
+def prune_logs(logdir: Path) -> None:
+    """logs/ をジョブ単位 (%j.log/.err で1件) で直近 SG_LOG_KEEP 件に間引く。
+    実行中ジョブの分が mtime 最新で必ず残るよう、下限は 1 に丸める。"""
+    keep = max(1, int(os.environ.get("SG_LOG_KEEP", "10")))
+    jobs: dict = {}
+    for f in list(logdir.glob("*.log")) + list(logdir.glob("*.err")):
+        jobs.setdefault(f.stem, []).append(f)
+    ranked = sorted(jobs.values(),
+                    key=lambda fs: max(f.stat().st_mtime for f in fs),
+                    reverse=True)
+    removed = 0
+    for files in ranked[keep:]:
+        for f in files:
+            f.unlink(missing_ok=True)
+            removed += 1
+    if removed:
+        print(f"pruned {removed} old log files in {logdir.name}/ "
+              f"(keep {keep} jobs)", flush=True)
+
+
 def print_node_info() -> None:
     e = os.environ.get
     print(f"job {e('SLURM_JOB_ID', 'local')} on {os.uname().nodename} "
@@ -70,10 +91,11 @@ def print_node_info() -> None:
     out = subprocess.run(["free", "-g"], capture_output=True, text=True,
                          check=False).stdout.splitlines()
     print("\n".join(out[:2]), flush=True)
-    out = subprocess.run(["quota", "-s"], capture_output=True, text=True,
-                         check=False).stdout.splitlines()
-    if out:
-        print(out[-1], flush=True)
+    if shutil.which("quota"):  # コンテナには quota が無い
+        out = subprocess.run(["quota", "-s"], capture_output=True, text=True,
+                             check=False).stdout.splitlines()
+        if out:
+            print(out[-1], flush=True)
     subprocess.run(["df", "-h", "/dev/shm"], check=False)
 
 
@@ -92,6 +114,8 @@ def main() -> None:
     # ジョブファイルが SLURM_SUBMIT_DIR (= SGLang/) に cd し .env を source 済み
     workdir = Path.cwd()
     require_vars(COMMON_REQUIRED)
+
+    prune_logs(workdir / "logs")
 
     model_path = resolve_path(workdir, os.environ["SG_MODEL"])
     venv = workdir / ".venv"

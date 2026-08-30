@@ -17,7 +17,10 @@
 # 共通パイプラインは src/launch.py。ここにはサイト固有の差分だけを書く。
 
 set -euo pipefail
-cd "${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")" && pwd)}"
+# コンテナ起動 (--container 有効時) はスクリプトが /tmp/slurm/startup へ
+# コピーされ SLURM_SUBMIT_DIR も渡らないので dirname "$0" は使えない。
+# 素のノードでも cwd は submit dir で始まるので $PWD に落とす (津田沼と同じ)。
+cd "${SLURM_SUBMIT_DIR:-$PWD}"
 
 set -a
 source "${ENV_FILE:-.env}"
