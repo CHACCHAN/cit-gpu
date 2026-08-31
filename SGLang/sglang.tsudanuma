@@ -3,7 +3,9 @@
 #SBATCH --partition=research
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
+# CPU はノード32コアを他ユーザと分け合う。16 (部門上限) だと隣に 16+4 コアの
+# ジョブがいるだけで積み残しになるので 12 に落としてある (機能上は 8 でも足りる)
+#SBATCH --cpus-per-task=12
 #SBATCH --gpus-per-task=2
 #SBATCH --mem=256G
 #SBATCH --time=24:00:00
@@ -14,10 +16,11 @@
 # TP=2 の rank 間転送に /dev/shm が必要。サイト既定の 16G では足りない
 #CONTAINER --shm-size=32G
 
-# 津田沼 (gpumng2, H100 NVL x2) / DeepSeek-V4-Flash / TP=2
+# 津田沼 (gpumng2, H100 NVL x2) / Qwen3.8-Flash-Next-FP8 / TP=2
 # 共通パイプラインは src/launch.py。ここにはサイト固有の差分だけを書く。
 # コンテナには /usr/local/cuda (toolkit 一式) があるので
-# CUDA toolchain 補正 (SG_CUDA_FIXUPS) は不要 = 既定 0 のまま。
+# CUDA toolchain 補正 (SG_CUDA_FIXUPS) は不要 = 既定 0 のまま
+# (QSA indexer 等の JIT (sglang.kernels.jit) も同 toolkit で通る)。
 
 set -euo pipefail
 # コンテナ起動はスクリプトを /tmp/slurm/startup へコピーして実行し、
@@ -32,17 +35,37 @@ set +a
 # このサイトは外部公開が前提なので token を必須にする
 : "${TUNNEL_TOKEN:?}"
 
+# expandable_segments は custom all-reduce の CUDA graph IPC buffer 登録
+# (get_graph_buffer_ipc_meta) と非互換で、capture 時に
+# "RuntimeError: invalid argument" になる (job 14342 で実測)。
+# 空文字にして torch 既定 allocator に戻す (launch.py は setdefault なので通る)
+export PYTORCH_CUDA_ALLOC_CONF=
+
 # serve へのサイト固有引数。共通分は src/serve.py の base_args()。
-# 以下は渡さない。sglang が DeepseekV4ForCausalLM から自動で決めるため、
-# 上書きすると壊れる:
-#   --attention-backend -> dsv4 / --page-size -> 256
-#   --kv-cache-dtype -> fp8_e4m3 / --quantization -> config.json 由来
+# 以下は渡さない。sglang が Qwen4ExpForConditionalGeneration から自動で決める
+# (srt/arg_groups/overrides.py) ため、上書きすると壊れる:
+#   --attention-backend -> hybrid GDN + QSA (full層は QwenSparseAttnBackend)
+#   --page-size -> 64 (compressed QSA は full_slot//ratio の paged addressing 必須)
+#   --mamba-radix-cache-strategy -> auto = extra_buffer (page>1 のため)
+#   --quantization -> config.json の fp8 (block 128x128 W8A8)
+#   --kv-cache-dtype -> auto = bf16 / --mamba-ssm-dtype -> auto = config の float32
+# speculative / MTP (qwen4_exp_mtp) は通常 decode の安定運用を確認してから検討。
 ARGS=(
     --dist-timeout "${SG_DIST_TIMEOUT:-600}"
-    --moe-runner-backend "${SG_MOE_RUNNER_BACKEND:?}"
-    --enable-hierarchical-cache
-    --hicache-ratio 2
+    # FP8 routed experts (block 128x128) は TP 分割 (640/2=320) だと
+    # block_n 非整除でロード不能。EP で expert 単位に配る (.env の解説参照)
+    --ep-size "${SG_EP_SIZE:?}"
+    # 51B の N-gram embedding table (fp8 で計51GB、TP=2 で約26GB/rank) を
+    # CPU pinned memory に置いて非同期 prefetch する Qwen4-Exp 専用機能。
+    # BF16 checkpoint では auto で有効になるが、FP8 でもこれが無いと重みが
+    # H100 x2 に収まらないので明示する。--cpu-offload-gb とは併用不可
+    --ple-offload-embedding
 )
 
-# encoding/encoding_dsv4.py は sglang が reasoning-effort の判定に読むので必須
-exec python3 -u src/launch.py --marker encoding/encoding_dsv4.py -- "${ARGS[@]}"
+# DeepSeek 時代の --enable-hierarchical-cache --hicache-ratio 2 は外した。
+# HiCache の host 退避対象は full-KV のみで、QSA の compressed-K / index-K
+# state (srt/mem_cache/qsa_kv_pool.py) は復元されず、host から戻した prefix の
+# sparse attention が壊れる。device 側 radix cache は page 単位共有で
+# compressed slot も算術的に共有される設計なので既定のまま有効。
+
+exec python3 -u src/launch.py --marker chat_template.jinja -- "${ARGS[@]}"

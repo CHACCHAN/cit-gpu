@@ -126,8 +126,9 @@ def main() -> None:
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     os.environ["PYTHONUNBUFFERED"] = "1"
     os.environ["PIP_NO_CACHE_DIR"] = "1"
-    # CUDA graph の捕獲に失敗する場合はこの行を外す
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    # CUDA graph の捕獲に失敗する場合はジョブファイル側で空文字に上書きする
+    # (custom all-reduce の IPC buffer 登録と expandable_segments は非互換)
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     Path(os.environ["HF_HOME"]).mkdir(parents=True, exist_ok=True)
 
     print_node_info()

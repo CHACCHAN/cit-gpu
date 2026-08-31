@@ -1,8 +1,12 @@
-# Qwen3.8-27B を SGLang で配信 (新習志野 / gpumng)
+# Qwen を SGLang で配信 (新習志野 / 津田沼)
 
-新習志野 GPGPU 1号機 (`gpumng.cle.it-chiba.ac.jp`, RTX A4500 20GB x4, TP=4) で
-SGLang を動かし、OpenAI 互換 API を CodeAgent 向けに提供する。
-津田沼 (`gpumng2`, H100 NVL x2) の DeepSeek-V4-Flash 構成からの移行。
+SGLang で OpenAI 互換 API を CodeAgent 向けに提供する。2サイト構成:
+
+- 新習志野 (`gpumng.cle.it-chiba.ac.jp`, RTX A4500 20GB x4, TP=4): Qwen3.8-27B-AWQ-INT4
+- 津田沼 (`gpumng2`, H100 NVL 94GB x2, TP=2/EP=2): Qwen3.8-Flash-Next-FP8
+  (旧 DeepSeek-V4-Flash 構成から 2026-08-31 に移行。「津田沼」の章を参照)
+
+この README の本文は主に新習志野の運用を説明している。
 
 ジョブファイル (`sglang.shinnarashino` / `sglang.tsudanuma`) を sbatch する。
 `src/` は両サイト共通の汎用パイプライン (Python)。サイト差分 (必須変数・
@@ -293,6 +297,45 @@ INFO ログに出すため)。`logs/` は .gitignore 済みだが共有はしな
 - 起動時の `libtorchcodec` / `sarashina2_vision` の import エラーは
   2026-08-30 に潰した (「venv の後始末」参照)。どちらも無害だったが、
   前者が `logs/*.err` の 95% を占めていた。
+
+## 津田沼 (Qwen3.8-Flash-Next)
+
+`sglang.tsudanuma` を sbatch する。2026-08-31 に DeepSeek-V4-Flash から
+`Qwen/Qwen3.8-Flash-Next-FP8` (176B / 6B active, GDN+QSA hybrid, PLE 51B) へ移行した。
+検証済み: 通常会話 / reasoning (`reasoning_content`) / streaming / tool calling
+(`qwen3_coder`) / 45k トークン prefill での needle 検索。
+
+| 項目 | 値 | 理由 |
+|---|---|---|
+| checkpoint | `Qwen/Qwen3.8-Flash-Next-FP8` (173GB) | BF16 (335GB) は PLE offload 込みでも H100x2 に収まらない。routed experts のみ FP8 (block 128x128)、他は bf16 |
+| sglang | PR #36497 head (78c5024e) の wheel を `vendor/` に固定 | qwen4_exp 対応は 0.5.18 までのリリースに無い。再ビルド: `SGLANG_BUILD_RUST_EXTS=none pip wheel --no-deps -w vendor "sglang @ git+https://github.com/sgl-project/sglang.git@78c5024e9d9f589dcb4deb7f4ba4fb23f7e85385#subdirectory=python"` (rust 拡張は grpc 用で不使用)。リリース入り後は `SG_PACKAGE=sglang==<版>` に戻して `rm -rf .venv` |
+| TP / EP | 2 / 2 | FP8 block 128 は TP 分割 (640/2=320) だと非整除でロード不能。EP で expert 丸ごと配分 |
+| PLE | `--ple-offload-embedding` (fp8, pinned host 計51GB) | これが無いと重みが収まらない。lookup は非同期 prefetch |
+| context | 262144 (native) | YaRN 不使用。`/v1/models` の max_model_len で確認 |
+| KV | bf16 / 854,784 token/rank (9.8GB) + GDN state 173 slot (9.4GB) | |
+| VRAM | 87.0 / 86.4 GiB (重み 62.9GB/rank + pool, mem-fraction 0.90) | |
+| Host RAM | sglang RSS 74GB (PLE pinned 51GB 含む) / 上限 256GB | |
+| 実測 | TTFT 0.15s / decode 124 tok/s / prefill 6,424 tok/s (45k) | 単発リクエスト |
+
+DeepSeek 時代から外したもの:
+
+- `--moe-runner-backend marlin` (MXFP4 用)、`encoding/encoding_dsv4.py` marker、
+  `deepseek-v4` / `deepseekv4` parser → `qwen3` / `qwen3_coder`
+- `--enable-hierarchical-cache --hicache-ratio 2`: HiCache の host 退避は full-KV
+  のみで、QSA の compressed-K / index-K state は復元されず sparse attention が壊れる
+- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`: custom all-reduce の
+  CUDA graph IPC buffer 登録と非互換 (job 14342 で "invalid argument" 実測)。
+  launch.py を setdefault にし、ジョブ側で空に上書き
+
+既知の問題 (津田沼):
+
+- Cloudflare Tunnel が `Unauthorized: Invalid tunnel secret` で張れない
+  (2026-08-31、トークンは稼働していた朝と同一バイト列 → サーバ側で失効/rotate)。
+  API はノード直 (`t-gpu01:5050`) では正常。ダッシュボードで新トークンを発行して
+  `.env` の `TUNNEL_TOKEN` を差し替えること
+- MTP / speculative decoding (`qwen4_exp_mtp`) は未使用 (DeepSeek 時代も未使用)。
+  通常 decode の安定運用を確認してから検討
+- 初回リクエストは JIT/autotune で数十秒かかる (2回目以降は上記実測値)
 
 ## SGLang の更新
 
