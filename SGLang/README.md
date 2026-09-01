@@ -3,7 +3,7 @@
 SGLang で OpenAI 互換 API を CodeAgent 向けに提供する。2サイト構成:
 
 - 新習志野 (`gpumng.cle.it-chiba.ac.jp`, RTX A4500 20GB x4, TP=4): Qwen3.8-27B-AWQ-INT4
-- 津田沼 (`gpumng2`, H100 NVL 94GB x2, TP=2/EP=2): Qwen3.8-Flash-Next-FP8
+- 津田沼 (`gpumng2`, H100 NVL 94GB x2, TP=2/EP=2): Qwen3.8-Flash-Next-Uncensored-FP8
   (旧 DeepSeek-V4-Flash 構成から 2026-08-31 に移行。「津田沼」の章を参照)
 
 この README の本文は主に新習志野の運用を説明している。
@@ -305,9 +305,17 @@ INFO ログに出すため)。`logs/` は .gitignore 済みだが共有はしな
 検証済み: 通常会話 / reasoning (`reasoning_content`) / streaming / tool calling
 (`qwen3_coder`) / 45k トークン prefill での needle 検索。
 
+2026-09-02 に checkpoint を abliterated 版
+`orcarouter/Qwen3.8-Flash-Next-Uncensored-FP8` へ差し替えた (`.env` の
+`SG_MODEL_REPO` / `SG_MODEL` のみの変更)。config / tokenizer / chat_template /
+全152,089テンソルの dtype・shape は公式 FP8 と同一
+(唯一の config 差分 `quantization_config.modules_to_convert` は sglang 未参照)。
+repo は gated (自動承認型) のため取得には `HF_TOKEN` が必要。
+quota (240GB) の都合で旧 checkpoint とは併存できず、models/ を入れ替えて運用する。
+
 | 項目 | 値 | 理由 |
 |---|---|---|
-| checkpoint | `Qwen/Qwen3.8-Flash-Next-FP8` (173GB) | BF16 (335GB) は PLE offload 込みでも H100x2 に収まらない。routed experts のみ FP8 (block 128x128)、他は bf16 |
+| checkpoint | `orcarouter/Qwen3.8-Flash-Next-Uncensored-FP8` (173GB) | 公式 `Qwen/Qwen3.8-Flash-Next-FP8` の abliterated 版 (テンソル構成は同一)。BF16 (335GB) は PLE offload 込みでも H100x2 に収まらない。routed experts のみ FP8 (block 128x128)、他は bf16 |
 | sglang | PR #36497 head (78c5024e) の wheel を `vendor/` に固定 | qwen4_exp 対応は 0.5.18 までのリリースに無い。再ビルド: `SGLANG_BUILD_RUST_EXTS=none pip wheel --no-deps -w vendor "sglang @ git+https://github.com/sgl-project/sglang.git@78c5024e9d9f589dcb4deb7f4ba4fb23f7e85385#subdirectory=python"` (rust 拡張は grpc 用で不使用)。リリース入り後は `SG_PACKAGE=sglang==<版>` に戻して `rm -rf .venv` |
 | TP / EP | 2 / 2 | FP8 block 128 は TP 分割 (640/2=320) だと非整除でロード不能。EP で expert 丸ごと配分 |
 | PLE | `--ple-offload-embedding` (fp8, pinned host 計51GB) | これが無いと重みが収まらない。lookup は非同期 prefetch |

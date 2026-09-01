@@ -16,7 +16,7 @@
 # TP=2 の rank 間転送に /dev/shm が必要。サイト既定の 16G では足りない
 #CONTAINER --shm-size=32G
 
-# 津田沼 (gpumng2, H100 NVL x2) / Qwen3.8-Flash-Next-FP8 / TP=2
+# 津田沼 (gpumng2, H100 NVL x2) / Qwen3.8-Flash-Next-Uncensored-FP8 / TP=2
 # 共通パイプラインは src/launch.py。ここにはサイト固有の差分だけを書く。
 # コンテナには /usr/local/cuda (toolkit 一式) があるので
 # CUDA toolchain 補正 (SG_CUDA_FIXUPS) は不要 = 既定 0 のまま
