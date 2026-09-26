@@ -1,13 +1,42 @@
-# Load balancer for llama-server replicas (launch.py --replicas N).
-# LLAMA_UPSTREAMS is set by launch.py, e.g. "127.0.0.1:5051 127.0.0.1:5052".
+# Front of every llama-server job. launch.py sets LLAMA_UPSTREAMS (e.g. "127.0.0.1:5051 127.0.0.1:5052")
+# and LLAMA_SLOTS (--parallel of each llama-server).
 {
 	admin off
 	auto_https off
 }
 
 :5050 {
+	# /slots can contain prompt text and /metrics is internal: LAN only.
+	# Requests through the Cloudflare Tunnel always carry Cf-Connecting-Ip.
+	@public_diag {
+		path /slots* /metrics*
+		header Cf-Connecting-Ip *
+	}
+	respond @public_diag 403
+
 	reverse_proxy {$LLAMA_UPSTREAMS} {
-		lb_policy least_conn
+		# The same client (one httpx client per Hermes conversation) sticks to one
+		# replica so its prompt cache is reused; new clients go to the least busy one.
+		lb_policy cookie LLAMA_LB {
+			fallback least_conn
+		}
+		# A replica with all slots in use counts as unavailable: a queued request gets
+		# no bytes (Cloudflare cuts it at 100 s), so go to another replica, or wait here up to
+		# 45 s (+ up to 30 s to the first SSE comment < 100 s) and then answer 503.
+		unhealthy_request_count {$LLAMA_SLOTS}
+		lb_try_duration 45s
+		health_uri /health
+		health_interval 5s
 		flush_interval -1
+		transport http {
+			read_timeout 35m
+		}
+	}
+
+	# No healthy replica: answer at once so the client moves on (no queue here).
+	handle_errors 502 503 {
+		header Retry-After 2
+		header Content-Type application/json
+		respond `{"error":{"message":"no llama-server backend is available","type":"server_error","code":503}}` 503
 	}
 }

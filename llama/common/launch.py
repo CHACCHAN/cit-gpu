@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Run llama-server (and a Cloudflare Tunnel if .env has TUNNEL_TOKEN) inside one Slurm job.
+"""Run llama-server behind Caddy (and a Cloudflare Tunnel if .env has TUNNEL_TOKEN) in one Slurm job.
 
     python3 -u common/launch.py --server BIN --model GGUF [--lora GGUF] --alias NAME
         [--replicas N] [--dry-run] -- LLAMA_SERVER_ARGS...
 
-With --replicas N the job's GPUs are split into N groups, one llama-server each,
-and Caddy (bin/caddy, common/Caddyfile) balances them on port 5050.
+The job's GPUs are split into N groups (default 1), one llama-server each on 127.0.0.1:5051+,
+and Caddy (bin/caddy, common/Caddyfile) serves them on port 5050.
 """
 
 import argparse
@@ -75,8 +75,7 @@ def main():
     env = load_env()
     key = env["LLAMA_API_KEY"]
     token = env.get("TUNNEL_TOKEN")
-    required = [args.server, args.model] + [p for p in (
-        args.lora, token and CLOUDFLARED, args.replicas > 1 and CADDY) if p]
+    required = [args.server, args.model, CADDY] + [p for p in (args.lora, token and CLOUDFLARED) if p]
     for path in required:
         if not path.is_file():
             raise RuntimeError(f"Required file is missing: {path}")
@@ -85,17 +84,14 @@ def main():
     if args.lora:
         command += ["--lora", str(args.lora)]
     command += [*args.server_args, "--alias", args.alias]
-    if args.replicas == 1:
-        ports, host = [PORT], "0.0.0.0"
-    else:
-        ports, host = [PORT + 1 + i for i in range(args.replicas)], "127.0.0.1"
+    ports = [PORT + 1 + i for i in range(args.replicas)]
     visible = env.get("CUDA_VISIBLE_DEVICES")  # Unset on the login node (--dry-run)
     gpus = visible.split(",") if visible else [""] * args.replicas
     if len(gpus) % args.replicas:
         raise RuntimeError(f"{len(gpus)} GPUs cannot be split into {args.replicas} replicas")
     per = len(gpus) // args.replicas
     groups = [",".join(gpus[i * per:(i + 1) * per]) for i in range(args.replicas)]
-    commands = [command + ["--host", host, "--port", str(port)] for port in ports]
+    commands = [command + ["--host", "127.0.0.1", "--port", str(port)] for port in ports]
     for gpu, cmd in zip(groups, commands):
         print(f"command (GPU {gpu or 'all'}):", " ".join(cmd), flush=True)
     print(f"Tunnel: {'on' if token else 'off'}", flush=True)
@@ -128,11 +124,12 @@ def main():
             if STOP:
                 return 0
             raise RuntimeError("llama-server did not become healthy within 1 hour")
-        if args.replicas > 1:
-            env["LLAMA_UPSTREAMS"] = " ".join(f"127.0.0.1:{port}" for port in ports)
-            balancer = subprocess.Popen(
-                [str(CADDY), "run", "--config", str(ROOT / "common/Caddyfile"),
-                 "--adapter", "caddyfile"], env=env, start_new_session=True)
+        env["LLAMA_UPSTREAMS"] = " ".join(f"127.0.0.1:{port}" for port in ports)
+        extra = args.server_args
+        env["LLAMA_SLOTS"] = extra[extra.index("--parallel") + 1] if "--parallel" in extra else "1"
+        balancer = subprocess.Popen(
+            [str(CADDY), "run", "--config", str(ROOT / "common/Caddyfile"),
+             "--adapter", "caddyfile"], env=env, start_new_session=True)
         print("llama-server ready", flush=True)
 
         if token:

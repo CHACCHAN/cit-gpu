@@ -21,5 +21,6 @@ exec python3 -u common/launch.py "$@" \
     --lora adapters/MiMo-V2.6-Flash-RL-Uncensored-Heretic-lora.gguf \
     --alias mimo-v2.6-flash-rl-q3_k -- \
     -ngl all -sm layer -ts 1,1 -fa on -ctk q8_0 -ctv q8_0 \
-    --threads 8 --threads-batch 8 --parallel 3 --kv-unified \
-    --kv-unified-per-slot 524288 --fit off --jinja
+    --threads 8 --threads-batch 8 --parallel 4 --kv-unified \
+    --kv-unified-per-slot 393216 --cache-ram 65536 --cache-reuse 256 --metrics \
+    --fit off --jinja
