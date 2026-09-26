@@ -11,8 +11,9 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from pathlib import Path
 from typing import Any
+
+from env import load_env
 
 # Merged into every chat request, e.g. {"reasoning_effort": "none"} for Bonsai
 EXTRA_BODY: dict = {}
@@ -151,7 +152,8 @@ def long_context_round(base: str, key: str, model: str, target: int) -> None:
           f"prompt_tok/s={timings.get('prompt_per_second', '?')}", flush=True)
 
 
-def all_long_round(base: str, key: str, model: str, count: int, slot_ctx: int) -> None:
+def all_long_round(base: str, key: str, model: str, count: int, slot_ctx: int,
+                   per_server: int) -> None:
     target = slot_ctx * 250000 // 262144
     prompts = []
     for i in range(count):
@@ -192,8 +194,9 @@ def all_long_round(base: str, key: str, model: str, count: int, slot_ctx: int) -
     wall = time.monotonic() - start
     usages = [r.get("usage", {}) for r, _ in results]
     prompt_total = sum(usage.get("prompt_tokens", 0) for usage in usages)
-    if peak_busy < count:
-        raise RuntimeError(f"Only {peak_busy} of {count} slots were busy together")
+    # Behind a load balancer /slots shows one replica's slots.
+    if peak_busy < per_server:
+        raise RuntimeError(f"Only {peak_busy} of {per_server} slots were busy together")
     if any(usage.get("prompt_tokens", 0) < target * 0.9 for usage in usages):
         raise RuntimeError(f"{count} long contexts were truncated: {usages}")
     output_total = sum(usage.get("completion_tokens", 0) for usage in usages)
@@ -205,17 +208,17 @@ def all_long_round(base: str, key: str, model: str, count: int, slot_ctx: int) -
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:8081")
-    parser.add_argument("--api-key-file", type=Path,
-                        default=Path(__file__).resolve().parents[1] / ".secrets/api-keys")
     parser.add_argument("--slots", type=int, default=4)
     parser.add_argument("--slot-ctx", type=int, default=262144)
+    parser.add_argument("--replicas", type=int, default=1,
+                        help="llama-server replicas behind the load balancer")
     parser.add_argument("--body", type=json.loads, default={})
     parser.add_argument("--long-context", action="store_true")
     parser.add_argument("--all-long", action="store_true")
     args = parser.parse_args()
     EXTRA_BODY.update(args.body)
     base = args.url.rstrip("/")
-    key = args.api_key_file.read_text().strip()
+    key = load_env()["LLAMA_API_KEY"]
     unauthenticated = None
     try:
         with urllib.request.urlopen(
@@ -238,14 +241,15 @@ def main() -> None:
     models, _ = call(base, key, "/v1/models")
     model = models["data"][0]["id"]
     print("Model:", model, flush=True)
+    per_server = args.slots // args.replicas
     props, _ = call(base, key, "/props")
-    if props.get("total_slots") != args.slots:
-        raise RuntimeError(f"Expected {args.slots} slots, got {props.get('total_slots')}")
+    if props.get("total_slots") != per_server:
+        raise RuntimeError(f"Expected {per_server} slots, got {props.get('total_slots')}")
     slots, _ = call(base, key, "/slots")
     contexts = [slot.get("n_ctx") for slot in slots]
-    if len(slots) != args.slots or any(n != args.slot_ctx for n in contexts):
-        raise RuntimeError(f"Expected {args.slots} x {args.slot_ctx}-token slots, got {contexts}")
-    print(f"{args.slots} x {args.slot_ctx}-token slots: OK", flush=True)
+    if len(slots) != per_server or any(n != args.slot_ctx for n in contexts):
+        raise RuntimeError(f"Expected {per_server} x {args.slot_ctx}-token slots, got {contexts}")
+    print(f"{args.replicas} x {per_server} x {args.slot_ctx}-token slots: OK", flush=True)
     result, wall = chat(base, key, model, "Hello. Respond briefly.")
     if not result.get("choices"):
         raise RuntimeError("Chat completion failed")
@@ -264,7 +268,7 @@ def main() -> None:
             if target < args.slot_ctx:
                 long_context_round(base, key, model, target)
     if args.all_long:
-        all_long_round(base, key, model, args.slots, args.slot_ctx)
+        all_long_round(base, key, model, args.slots, args.slot_ctx, per_server)
 
 
 if __name__ == "__main__":

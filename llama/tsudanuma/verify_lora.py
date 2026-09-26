@@ -10,11 +10,14 @@ import re
 import subprocess
 import time
 import urllib.request
+import sys
 from pathlib import Path
 
-from verify import call
-
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "common"))
+from env import load_env  # noqa: E402
+from verify import call  # noqa: E402
+
 ADAPTER = ROOT / "adapters/MiMo-V2.6-Flash-RL-Uncensored-Heretic-lora.gguf"
 
 
@@ -196,10 +199,9 @@ def performance_round(base: str, key: str, model: str, adapter_id: int,
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:8081")
-    parser.add_argument("--api-key-file", type=Path, default=ROOT / ".secrets/api-keys")
     args = parser.parse_args()
     base = args.url.rstrip("/")
-    key = args.api_key_file.read_text().strip()
+    key = load_env()["LLAMA_API_KEY"]
     adapters, _ = call(base, key, "/lora-adapters")
     if not isinstance(adapters, list) or len(adapters) != 1:
         raise RuntimeError(f"Expected exactly one loaded adapter: {adapters}")

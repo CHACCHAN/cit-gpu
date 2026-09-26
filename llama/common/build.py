@@ -4,7 +4,7 @@
 The CUDA runtime and cuBLAS are copied next to it, so the result runs on nodes
 with only the NVIDIA driver and can be rsynced to the other site.
 
-    python3 src/build.py --repo URL --ref COMMIT --arch 86 --dest DIR
+    python3 common/build.py --repo URL --ref COMMIT --arch 86 --dest DIR
 """
 
 import argparse

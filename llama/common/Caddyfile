@@ -1,0 +1,13 @@
+# Load balancer for llama-server replicas (launch.py --replicas N).
+# LLAMA_UPSTREAMS is set by launch.py, e.g. "127.0.0.1:5051 127.0.0.1:5052".
+{
+	admin off
+	auto_https off
+}
+
+:5050 {
+	reverse_proxy {$LLAMA_UPSTREAMS} {
+		lb_policy least_conn
+		flush_interval -1
+	}
+}

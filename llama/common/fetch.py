@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Download a pinned file from Hugging Face and check its LFS SHA-256.
 
-    python3 src/fetch.py --repo OWNER/NAME --revision COMMIT --dest DIR FILE
+    python3 common/fetch.py --repo OWNER/NAME --revision COMMIT --dest DIR FILE
 """
 
 import argparse

@@ -3,6 +3,8 @@ llama.cpp-prism/
 models/
 adapters/
 logs/
+.env
 .secrets/
 .cache/
 __pycache__/
+bin/

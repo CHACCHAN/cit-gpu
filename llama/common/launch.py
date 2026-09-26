@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Run llama-server (and a Cloudflare Tunnel if a token is given) inside one Slurm job.
+"""Run llama-server (and a Cloudflare Tunnel if .env has TUNNEL_TOKEN) inside one Slurm job.
 
-    python3 -u src/launch.py --server BIN --model GGUF [--lora GGUF] --alias NAME
-        [--tunnel-token FILE] [--dry-run] -- LLAMA_SERVER_ARGS...
+    python3 -u common/launch.py --server BIN --model GGUF [--lora GGUF] --alias NAME
+        [--replicas N] [--dry-run] -- LLAMA_SERVER_ARGS...
+
+With --replicas N the job's GPUs are split into N groups, one llama-server each,
+and Caddy (bin/caddy, common/Caddyfile) balances them on port 5050.
 """
 
 import argparse
@@ -15,9 +18,11 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from env import load_env
+
 ROOT = Path(__file__).resolve().parents[1]
-API_KEYS = ROOT / ".secrets/api-keys"
 CLOUDFLARED = ROOT.parent / "SGLang/bin/cloudflared"
+CADDY = ROOT / "bin/caddy"
 PORT = 5050
 STOP = False
 
@@ -44,9 +49,9 @@ def stop_process(process):
         process.wait()
 
 
-def healthy(key):
+def healthy(port, key):
     request = urllib.request.Request(
-        f"http://127.0.0.1:{PORT}/health",
+        f"http://127.0.0.1:{port}/health",
         headers={"Authorization": f"Bearer {key}"},
     )
     try:
@@ -62,78 +67,94 @@ def main():
     parser.add_argument("--model", type=lambda p: ROOT / p, required=True)
     parser.add_argument("--lora", type=lambda p: ROOT / p)
     parser.add_argument("--alias", required=True)
-    parser.add_argument("--tunnel-token", type=lambda p: ROOT / p)
+    parser.add_argument("--replicas", type=int, default=1)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("server_args", nargs="*")
     args = parser.parse_args()
 
-    secrets = [API_KEYS] + ([args.tunnel_token] if args.tunnel_token else [])
-    required = [args.server, args.model, *secrets]
-    required += [p for p in (args.lora, args.tunnel_token and CLOUDFLARED) if p]
+    env = load_env()
+    key = env["LLAMA_API_KEY"]
+    token = env.get("TUNNEL_TOKEN")
+    required = [args.server, args.model] + [p for p in (
+        args.lora, token and CLOUDFLARED, args.replicas > 1 and CADDY) if p]
     for path in required:
         if not path.is_file():
             raise RuntimeError(f"Required file is missing: {path}")
-    for path in secrets:
-        if path.stat().st_mode & 0o077:
-            raise RuntimeError(f"Secret file permissions are too broad: {path}")
-    key = API_KEYS.read_text().strip()
-    token = args.tunnel_token.read_text().strip() if args.tunnel_token else None
-    if not key or "\n" in key or token == "":
-        raise RuntimeError("Invalid API key or Tunnel token")
 
     command = [str(args.server), "-m", str(args.model)]
     if args.lora:
         command += ["--lora", str(args.lora)]
-    command += [
-        *args.server_args, "--alias", args.alias, "--api-key-file", str(API_KEYS),
-        "--host", "0.0.0.0", "--port", str(PORT),
-    ]
-    print("command:", " ".join(command), flush=True)
+    command += [*args.server_args, "--alias", args.alias]
+    if args.replicas == 1:
+        ports, host = [PORT], "0.0.0.0"
+    else:
+        ports, host = [PORT + 1 + i for i in range(args.replicas)], "127.0.0.1"
+    visible = env.get("CUDA_VISIBLE_DEVICES")  # Unset on the login node (--dry-run)
+    gpus = visible.split(",") if visible else [""] * args.replicas
+    if len(gpus) % args.replicas:
+        raise RuntimeError(f"{len(gpus)} GPUs cannot be split into {args.replicas} replicas")
+    per = len(gpus) // args.replicas
+    groups = [",".join(gpus[i * per:(i + 1) * per]) for i in range(args.replicas)]
+    commands = [command + ["--host", host, "--port", str(port)] for port in ports]
+    for gpu, cmd in zip(groups, commands):
+        print(f"command (GPU {gpu or 'all'}):", " ".join(cmd), flush=True)
+    print(f"Tunnel: {'on' if token else 'off'}", flush=True)
     if args.dry_run:
         return 0
 
     # Resolve the libraries next to llama-server, whatever RUNPATH the build has.
-    env = os.environ.copy()
     env["LD_LIBRARY_PATH"] = ":".join(
         filter(None, [str(args.server.parent), env.get("LD_LIBRARY_PATH")]))
+    env["QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING"] = "1"
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
-    server = tunnel = None
+    servers = []
+    tunnel = balancer = None
     try:
-        server = subprocess.Popen(command, env=env, start_new_session=True)
+        for gpu, cmd in zip(groups, commands):
+            servers.append(subprocess.Popen(
+                cmd, env={**env, "CUDA_VISIBLE_DEVICES": gpu} if gpu else env,
+                start_new_session=True))
         deadline = time.monotonic() + 3600
         while not STOP and time.monotonic() < deadline:
-            if server.poll() is not None:
-                raise RuntimeError(f"llama-server exited: {server.returncode}")
-            if healthy(key):
+            for server in servers:
+                if server.poll() is not None:
+                    raise RuntimeError(f"llama-server exited: {server.returncode}")
+            if all(healthy(port, key) for port in ports):
                 break
             time.sleep(5)
         else:
             if STOP:
                 return 0
             raise RuntimeError("llama-server did not become healthy within 1 hour")
+        if args.replicas > 1:
+            env["LLAMA_UPSTREAMS"] = " ".join(f"127.0.0.1:{port}" for port in ports)
+            balancer = subprocess.Popen(
+                [str(CADDY), "run", "--config", str(ROOT / "common/Caddyfile"),
+                 "--adapter", "caddyfile"], env=env, start_new_session=True)
         print("llama-server ready", flush=True)
 
         if token:
-            env = os.environ.copy()
-            env["TUNNEL_TOKEN"] = token
-            env["QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING"] = "1"
             tunnel = subprocess.Popen(
                 [str(CLOUDFLARED), "tunnel", "--no-autoupdate", "--loglevel", "info", "run"],
                 env=env, start_new_session=True,
             )
             print("Cloudflare Tunnel started", flush=True)
         while not STOP:
-            if server.poll() is not None:
-                raise RuntimeError(f"llama-server exited: {server.returncode}")
-            if tunnel is not None and tunnel.poll() is not None:
-                raise RuntimeError(f"cloudflared exited: {tunnel.returncode}")
+            for server in servers:
+                if server.poll() is not None:
+                    raise RuntimeError(f"llama-server exited: {server.returncode}")
+            for name, process in (("cloudflared", tunnel), ("caddy", balancer)):
+                if process is not None and process.poll() is not None:
+                    raise RuntimeError(f"{name} exited: {process.returncode}")
             time.sleep(5)
         return 0
     finally:
         stop_process(tunnel)
-        stop_process(server)
+        stop_process(balancer)
+        for server in servers:
+            stop_process(server)
 
 
 if __name__ == "__main__":
