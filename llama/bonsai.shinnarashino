@@ -1,0 +1,24 @@
+#!/bin/bash
+#SBATCH --partition=research
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --gpus-per-task=5
+#SBATCH --mem=128G
+#SBATCH --time=24:00:00
+#SBATCH --output=logs/%j.log
+#SBATCH --error=logs/%j.err
+
+# 新習志野 A4500 x5 / Ternary Bonsai 2 27B PQ2_0, 262144 x 8 slots (docs/shinnarashino.md)
+# 公開するときは --tunnel-token .secrets/tunnel-token.shinnarashino を足す
+set -euo pipefail
+cd "${SLURM_SUBMIT_DIR:-$PWD}"
+# P2P が壊れた GPU があるので、GPU 間転送はホスト経由のままにする
+unset GGML_CUDA_P2P
+exec python3 -u src/launch.py "$@" \
+    --server llama.cpp-prism/build/bin/llama-server \
+    --model models/Bonsai-2-27B/Ternary-Bonsai-2-27B-PQ2_0.gguf \
+    --alias bonsai-2-27b-pq2_0 -- \
+    -ngl 999 -sm layer -ts 1,1,1,1,1 -fa on -ctk q8_0 -ctv q8_0 \
+    --threads 8 --threads-batch 8 -c 2097152 --parallel 8 --no-kv-unified \
+    --fit off --jinja
