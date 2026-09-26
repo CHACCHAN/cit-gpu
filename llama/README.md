@@ -4,8 +4,8 @@ llama-server で OpenAI 互換 API を提供する。コマンドはすべて `l
 
 | サイト | ジョブ | モデル | 公開URL |
 |---|---|---|---|
-| 津田沼 (H100 NVL ×2) | `tsudanuma/mimo.sbatch` | MiMo V2.6 Flash RL Q3_K + LoRA、524288 ×3 slot | `https://gpgpu2.cc-chacchan.com` |
-| 新習志野 (A4500 ×5) | `shinnarashino/bonsai.sbatch` | Ternary Bonsai 2 27B PQ2_0、GPU 1 枚ずつ 262144 ×5 slot | `https://gpgpu.cc-chacchan.com` |
+| 津田沼 (H100 NVL ×2) | `tsudanuma/mimo` | MiMo V2.6 Flash RL Q3_K + LoRA、524288 ×3 slot | `https://gpgpu2.cc-chacchan.com` |
+| 新習志野 (A4500 ×5) | `shinnarashino/bonsai` | Ternary Bonsai 2 27B PQ2_0、GPU 1 枚ずつ 262144 ×5 slot | `https://gpgpu.cc-chacchan.com` |
 
 手順とサイト固有の注意は各フォルダの README.md。
 
@@ -17,6 +17,7 @@ llama-server で OpenAI 互換 API を提供する。コマンドはすべて `l
 - `.env` (600): `LLAMA_API_KEY` と `TUNNEL_TOKEN`。`TUNNEL_TOKEN` が無ければ Tunnel は起動しない。雛形は `.env.example`
 
 ジョブファイルにはビルド・モデル・llama-server 引数だけを書く。
+`llama/` からでも各サイトのフォルダからでも `sbatch` できる。ログは投入したディレクトリの `logs/` に出る (先に `mkdir -p logs`)。
 `bash <ジョブ> --dry-run` で起動コマンドを確認できる。
 `models/` `adapters/` `llama.cpp*/` `bin/` `.env` `logs/` は Git 管理外。
 

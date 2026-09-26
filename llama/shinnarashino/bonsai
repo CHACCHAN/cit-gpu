@@ -10,9 +10,11 @@
 #SBATCH --error=logs/%j.err
 
 # 新習志野 A4500 x5 / Ternary Bonsai 2 27B PQ2_0, 1 GPU に 262144 x 1 slot を5つ (shinnarashino/README.md)
-# Submit from llama/: sbatch shinnarashino/bonsai.sbatch
 set -euo pipefail
+# llama/ でも llama/<site>/ でも投入できる (Slurm はスクリプトをコピーするので自分の場所は使えない)
+# ログは投入したディレクトリの logs/ に出る
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
+[ -f common/launch.py ] || cd ..
 exec python3 -u common/launch.py "$@" \
     --server llama.cpp-prism/build/bin/llama-server \
     --model models/Bonsai-2-27B/Ternary-Bonsai-2-27B-PQ2_0.gguf \

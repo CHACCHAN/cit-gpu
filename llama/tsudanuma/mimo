@@ -10,9 +10,11 @@
 #SBATCH --error=logs/%j.err
 
 # 津田沼 H100 NVL x2 / MiMo V2.6 Flash RL Q3_K + Heretic LoRA (tsudanuma/README.md)
-# Submit from llama/: Slurm copies the script, so its own directory is not usable.
 set -euo pipefail
+# llama/ でも llama/<site>/ でも投入できる (Slurm はスクリプトをコピーするので自分の場所は使えない)
+# ログは投入したディレクトリの logs/ に出る
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
+[ -f common/launch.py ] || cd ..
 exec python3 -u common/launch.py "$@" \
     --server llama.cpp/build/bin/llama-server \
     --model models/Q3_K/MiMo-V2.6-Flash-RL-Q3_K-00001-of-00004.gguf \

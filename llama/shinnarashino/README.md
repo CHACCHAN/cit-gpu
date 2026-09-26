@@ -31,8 +31,8 @@ mkdir -p bin && V=2.11.4 && (cd bin &&
     grep " caddy_${V}_linux_amd64.tar.gz$" caddy_${V}_checksums.txt | sha512sum -c - &&
     tar -xzf caddy_${V}_linux_amd64.tar.gz caddy && rm caddy_${V}_*)
 cp .env.example .env && chmod 600 .env   # LLAMA_API_KEY と TUNNEL_TOKEN を書く
-bash shinnarashino/bonsai.sbatch --dry-run
-sbatch shinnarashino/bonsai.sbatch
+bash shinnarashino/bonsai --dry-run
+sbatch shinnarashino/bonsai
 ```
 
 ## 検証

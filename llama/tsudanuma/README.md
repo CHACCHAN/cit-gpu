@@ -27,7 +27,7 @@ python3 common/fetch.py --repo MorinoNushi/MiMo-V2.6-Flash-RL-Uncensored-Heretic
     --revision 0ecc6864d187d4117d3348c85379bfe9298f49e3 \
     --dest adapters MiMo-V2.6-Flash-RL-Uncensored-Heretic-lora.gguf
 cp .env.example .env && chmod 600 .env   # LLAMA_API_KEY と TUNNEL_TOKEN を書く
-bash tsudanuma/mimo.sbatch --dry-run
+bash tsudanuma/mimo --dry-run
 ```
 
 nvcc はログインノードの `/usr/local/cuda-12.4/bin` にある (PATH に無ければ足す)。
@@ -36,13 +36,13 @@ cloudflared は `../SGLang/bin/cloudflared` を使う。
 ## 運用
 
 ```bash
-sbatch tsudanuma/mimo.sbatch
+sbatch tsudanuma/mimo
 tail -f logs/<jobid>.log logs/<jobid>.err
 ```
 
 停止は `scancel <jobid>`。24時間制限があるので、続けて動かすなら
-`sbatch --dependency=singleton tsudanuma/mimo.sbatch` で次を予約しておく。
-LoRA を外すときは `tsudanuma/mimo.sbatch` の `--lora` 行を消して再投入する。
+`sbatch --dependency=singleton tsudanuma/mimo` で次を予約しておく。
+LoRA を外すときは `tsudanuma/mimo` の `--lora` 行を消して再投入する。
 
 ## 検証
 
