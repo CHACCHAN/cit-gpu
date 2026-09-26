@@ -7,4 +7,3 @@ logs/
 .secrets/
 .cache/
 __pycache__/
-bin/
