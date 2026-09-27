@@ -1,4 +1,5 @@
 #!/bin/bash
+#SBATCH --job-name=bonsai
 #SBATCH --partition=research
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -9,7 +10,7 @@
 #SBATCH --output=logs/%j.log
 #SBATCH --error=logs/%j.err
 
-# 新習志野 A4500 x5 / Ternary Bonsai 2 27B PQ2_0, 1 GPU に 262144 x 1 slot を5つ (shinnarashino/README.md)
+# 新習志野 A4500 x5 / Ternary Bonsai 2 27B PQ2_0, 1 GPU に 163840 x 2 slot を5つ
 set -euo pipefail
 # llama/ でも llama/<site>/ でも投入できる (Slurm はスクリプトをコピーするので自分の場所は使えない)
 # ログは投入したディレクトリの logs/ に出る
@@ -18,8 +19,9 @@ cd "${SLURM_SUBMIT_DIR:-$PWD}"
 exec python3 -u common/launch.py "$@" \
     --server llama.cpp-prism/build/bin/llama-server \
     --model models/Bonsai-2-27B/Ternary-Bonsai-2-27B-PQ2_0.gguf \
-    --alias bonsai-2-27b-pq2_0 --replicas 5 -- \
+    --alias bonsai-2-27b-pq2_0 --replicas 5 \
+    -- \
     -ngl 999 -fa on -ctk q8_0 -ctv q8_0 \
-    --threads 2 --threads-batch 2 -c 262144 --parallel 1 \
+    --threads 2 --threads-batch 2 --threads-http 16 -c 327680 --parallel 2 \
     --cache-ram 32768 --metrics \
     --fit off --jinja --chat-template-file shinnarashino/bonsai.jinja

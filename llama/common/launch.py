@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Run llama-server behind Caddy (and a Cloudflare Tunnel if .env has TUNNEL_TOKEN) in one Slurm job.
+"""Run llama-server workers behind SGLang Gateway in one Slurm job.
 
     python3 -u common/launch.py --server BIN --model GGUF [--lora GGUF] --alias NAME
         [--replicas N] [--dry-run] -- LLAMA_SERVER_ARGS...
 
-The job's GPUs are split into N groups (default 1), one llama-server each on 127.0.0.1:5051+,
-and Caddy (bin/caddy, common/Caddyfile) serves them on port 5050.
+The job's GPUs are split into N groups (default 1), one llama-server each on
+127.0.0.1:5051+, and SGLang Gateway serves them on port 5050.
 """
 
 import argparse
@@ -22,7 +22,8 @@ from env import load_env
 
 ROOT = Path(__file__).resolve().parents[1]
 CLOUDFLARED = ROOT.parent / "SGLang/bin/cloudflared"
-CADDY = ROOT / "bin/caddy"
+ROUTER_PYTHON = ROOT / ".router-venv/bin/python"
+GATEWAY_SCRIPT = ROOT / "common/run_gateway.py"
 PORT = 5050
 STOP = False
 
@@ -71,11 +72,11 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("server_args", nargs="*")
     args = parser.parse_args()
-
     env = load_env()
     key = env["LLAMA_API_KEY"]
     token = env.get("TUNNEL_TOKEN")
-    required = [args.server, args.model, CADDY] + [p for p in (args.lora, token and CLOUDFLARED) if p]
+    required = [args.server, args.model, ROUTER_PYTHON, GATEWAY_SCRIPT]
+    required += [p for p in (args.lora, token and CLOUDFLARED) if p]
     for path in required:
         if not path.is_file():
             raise RuntimeError(f"Required file is missing: {path}")
@@ -106,7 +107,7 @@ def main():
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
     servers = []
-    tunnel = balancer = None
+    tunnel = router = None
     try:
         for gpu, cmd in zip(groups, commands):
             servers.append(subprocess.Popen(
@@ -125,11 +126,17 @@ def main():
                 return 0
             raise RuntimeError("llama-server did not become healthy within 1 hour")
         env["LLAMA_UPSTREAMS"] = " ".join(f"127.0.0.1:{port}" for port in ports)
-        extra = args.server_args
-        env["LLAMA_SLOTS"] = extra[extra.index("--parallel") + 1] if "--parallel" in extra else "1"
-        balancer = subprocess.Popen(
-            [str(CADDY), "run", "--config", str(ROOT / "common/Caddyfile"),
-             "--adapter", "caddyfile"], env=env, start_new_session=True)
+        router = subprocess.Popen(
+            [str(ROUTER_PYTHON), "-u", str(GATEWAY_SCRIPT)],
+            env=env, start_new_session=True)
+        for _ in range(120):
+            if router.poll() is not None:
+                raise RuntimeError(f"SGLang gateway exited: {router.returncode}")
+            if healthy(PORT, key):
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError("SGLang gateway did not become healthy")
         print("llama-server ready", flush=True)
 
         if token:
@@ -142,14 +149,15 @@ def main():
             for server in servers:
                 if server.poll() is not None:
                     raise RuntimeError(f"llama-server exited: {server.returncode}")
-            for name, process in (("cloudflared", tunnel), ("caddy", balancer)):
+            for name, process in (("cloudflared", tunnel),
+                                  ("SGLang gateway", router)):
                 if process is not None and process.poll() is not None:
                     raise RuntimeError(f"{name} exited: {process.returncode}")
             time.sleep(5)
         return 0
     finally:
         stop_process(tunnel)
-        stop_process(balancer)
+        stop_process(router)
         for server in servers:
             stop_process(server)
 

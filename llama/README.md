@@ -4,42 +4,41 @@ llama-server で OpenAI 互換 API を提供する。コマンドはすべて `l
 
 | サイト | ジョブ | モデル | 公開URL |
 |---|---|---|---|
-| 津田沼 (H100 NVL ×2) | `tsudanuma/mimo` | MiMo V2.6 Flash RL Q3_K + LoRA、393216 ×4 slot | `https://gpgpu2.cc-chacchan.com` |
-| 新習志野 (A4500 ×5) | `shinnarashino/bonsai` | Ternary Bonsai 2 27B PQ2_0、GPU 1 枚ずつ 262144 ×5 slot | `https://gpgpu.cc-chacchan.com` |
+| 津田沼 (H100 NVL ×2) | `tsudanuma/mimo` | MiMo V2.6 Flash RL Q3_K + LoRA、262144 ×6 slot | `https://gpgpu2.cc-chacchan.com` |
+| 新習志野 (A4500 ×5) | `shinnarashino/bonsai` | Ternary Bonsai 2 27B PQ2_0、GPU 1 枚ずつ 163840 ×2 slot、計10並列 | `https://gpgpu.cc-chacchan.com` |
 
-手順とサイト固有の注意は各フォルダの README.md。
+セットアップと運用は [津田沼](tsudanuma/README.md) / [新習志野](shinnarashino/README.md) を参照。
 
-## Caddy (両サイト共通、初回だけ)
+## SGLang Gateway (両サイト共通、初回だけ)
 
-公式リリースの static binary を checksum を確かめて `bin/caddy` に置く。
+SGLang Model Gateway が公開ポート 5050 を受け、llama-server の worker に推論を振り分ける。
+公開 `/props`、`/slots`、`/metrics`、`/lora-adapters` は 404。
+`/v1/models` は鍵なしで 200 を返すが、ID は `unknown`。
+管理用 `/workers` は鍵なし 401、既存の推論用鍵でも 403。
+席数は利用側で Bonsai 10、MiMo 6 に固定する。推論には既存の `LLAMA_API_KEY` が必要。
+
+## 混雑時
+
+Hermes の `relay-gpu-gate` は Bonsai 10 件、MiMo 6 件を超える依頼を Hermes 側で待たせる。
+Gateway 単体の上限は同時 64 件、待機列 100 件、待機期限 600 秒。
+この上限は worker の席数とは連動しない。公開 API を直接呼ぶ場合や、cache-aware の振り分けが
+一台に偏る場合は、llama-server 側で席待ちが起きる。長時間応答が始まらなければ
+Cloudflare のタイムアウトに達する可能性がある。
+
+`llama/` で Gateway をインストールする。
 
 ```bash
-mkdir -p bin && V=2.11.4 && (cd bin &&
-    curl -sSLO https://github.com/caddyserver/caddy/releases/download/v$V/caddy_${V}_linux_amd64.tar.gz &&
-    curl -sSLO https://github.com/caddyserver/caddy/releases/download/v$V/caddy_${V}_checksums.txt &&
-    grep " caddy_${V}_linux_amd64.tar.gz$" caddy_${V}_checksums.txt | sha512sum -c - &&
-    tar -xzf caddy_${V}_linux_amd64.tar.gz caddy && rm caddy_${V}_*)
+python3 -m venv .router-venv
+.router-venv/bin/pip install 'sglang-router==0.3.2'
 ```
 
-## 個人情報
+`.env` に `LLAMA_API_KEY` と `TUNNEL_TOKEN` を設定する。ジョブのログは投入ディレクトリの `logs/` に出る。
 
-プロンプトには個人の記録が含まれる。llama-server を `-v` など詳しいログで動かさない
-(既定のログは処理時間と token 数だけ)。Caddy はアクセスログを出さない。
+## 運用
 
-- `common/launch.py`: llama-server・Caddy・Cloudflare Tunnel の起動と終了。llama-server は 127.0.0.1:5051 から、
-  Caddy (`bin/caddy` + `common/Caddyfile`) が port 5050 で受ける。`--replicas N` で GPU を N 組に分けて N 個起動する
-- `common/Caddyfile`: cookie で同じクライアントを同じ llama-server に固定 (新規・固定先が満杯なら処理中の少ない方)。
-  slot が全部埋まった llama-server には送らず、送り先が無ければ最大 45 秒待ってから 503 + `Retry-After: 2`
-  (45 秒 + 最初の `:` まで最大 30 秒で Cloudflare の 100 秒に収まる)。`/slots` `/metrics` は Cloudflare 経由では 403 (LAN からは見える)
-- `common/build.py`: llama.cpp を commit 固定でビルド。CUDA runtime を同梱する
-- `common/fetch.py`: Hugging Face から revision 固定で取得し SHA-256 を検証
-- `common/verify.py`: 実 API の検証 (`--slots` / `--replicas` / `--slot-ctx` / `--body`)。`tsudanuma/verify_lora.py` は MiMo 専用
-- `.env` (600): `LLAMA_API_KEY` と `TUNNEL_TOKEN`。`TUNNEL_TOKEN` が無ければ Tunnel は起動しない。雛形は `.env.example`
+ジョブは 24 時間で終了する。継続する場合は `sbatch --dependency=singleton <ジョブ>` で
+同名の後続ジョブを 1 件予約する。`bash <ジョブ> --dry-run` で起動コマンドを確認できる。
+検証スクリプトは worker のローカルポート 5051 以降を使う。Gateway は 5050、Cloudflare Tunnel はそのポートへ接続する。
 
-ジョブファイルにはビルド・モデル・llama-server 引数だけを書く。
-`llama/` からでも各サイトのフォルダからでも `sbatch` できる。ログは投入したディレクトリの `logs/` に出る (先に `mkdir -p logs`)。
-`bash <ジョブ> --dry-run` で起動コマンドを確認できる。
-`models/` `adapters/` `llama.cpp*/` `bin/` `.env` `logs/` は Git 管理外。
-
-クラスタ共通: sbatch ラッパは終了コードを伝えない (`logs/<jobid>.err` の `ERROR:` を見る)。
-home は計算ノードと同期されている。演習モード中は research ジョブが強制終了・requeue される。
+プロンプトには個人の記録が含まれるため、llama-server の詳細ログ (`-v`) を有効にしない。
+API 鍵と Tunnel token は `.env` (権限 600) から読み、ジョブの引数には含めない。
