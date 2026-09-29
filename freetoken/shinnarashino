@@ -1,0 +1,14 @@
+#!/bin/bash
+#SBATCH --job-name=freetoken
+#SBATCH --partition=research
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --gpus-per-task=5
+#SBATCH --mem=480G
+#SBATCH --time=24:00:00
+#SBATCH --output=logs/%j.log
+#SBATCH --error=logs/%j.err
+set -euo pipefail
+cd "${SLURM_SUBMIT_DIR:-$PWD}"
+exec python3 -u launch.py
