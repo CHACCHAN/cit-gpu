@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Confirm the gateway sends requests to all five FreeToken workers."""
+"""Confirm the gateway spreads simultaneous, unrelated requests over every FreeToken worker."""
 
 import concurrent.futures
 import json
+import random
 import time
 import urllib.request
 from pathlib import Path
@@ -23,10 +24,13 @@ def completed(port):
 
 
 def request(index, config):
+    # 互いに無関係な長めの入力を同時に投げる。cache_aware でも負荷偏りで全 worker に分かれる。
+    rng = random.Random(index)
+    filler = " ".join(f"{rng.getrandbits(40):x}" for _ in range(600))
     payload = {
         "model": config["FT_MODEL_ID"],
-        "messages": [{"role": "user", "content": f"Test {index}: reply exactly OK."}],
-        "max_tokens": 16,
+        "messages": [{"role": "user", "content": f"Test {index}: {filler}\n\nReply with a short sentence."}],
+        "max_tokens": 64,
         "temperature": 0,
         "reasoning_effort": "low",
     }
@@ -36,7 +40,7 @@ def request(index, config):
         headers={"Content-Type": "application/json", "Authorization": "Bearer " + config["FT_API_KEY"]},
     )
     start = time.monotonic()
-    with urllib.request.urlopen(req, timeout=120) as response:
+    with urllib.request.urlopen(req, timeout=300) as response:
         result = json.load(response)
     if not result.get("choices"):
         raise RuntimeError(f"Request {index} returned no choices")
@@ -47,8 +51,9 @@ def main():
     config = configuration()
     ports = [int(config.get("FT_WORKER_PORT", "5051")) + 2 * i for i in range(int(config["FT_REPLICAS"]))]
     before = [completed(port) for port in ports]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(ports)) as pool:
-        results = list(pool.map(lambda i: request(i, config), range(len(ports) * 2)))
+    count = len(ports) * 4
+    with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
+        results = list(pool.map(lambda i: request(i, config), range(count)))
     after = [completed(port) for port in ports]
     deltas = [end - start for start, end in zip(before, after)]
     print(f"requests={results}", flush=True)
